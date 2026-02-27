@@ -10,28 +10,47 @@ _require() {
   done
 }
 
+# --- Argument parsing ---
+
+mode="ramfs"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ramfs)  mode="ramfs";  shift ;;
+    --stream) mode="stream"; shift ;;
+    -*)
+      echo "Error: unknown option '$1'" >&2
+      echo "" >&2
+      echo "Usage: flash-live-remote [--ramfs|--stream] <host> <image>" >&2
+      exit 1
+      ;;
+    *) break ;;
+  esac
+done
+
 if [ $# -lt 2 ]; then
-  echo "Usage: flash-live-remote <host> <image>" >&2
+  echo "Usage: flash-live-remote [--ramfs|--stream] <host> <image>" >&2
   echo "" >&2
   echo "Flash an image to a remote Linux device over the network." >&2
   echo "The device must be running and accessible via SSH." >&2
+  echo "" >&2
+  echo "Modes:" >&2
+  echo "  --ramfs   (default) scp image to /dev/shm, then decompress+dd locally" >&2
+  echo "  --stream  Stream image directly over SSH (for low-memory devices)" >&2
   echo "" >&2
   echo "Supported formats: .img, .img.xz, .img.gz" >&2
   echo "" >&2
   echo "Examples:" >&2
   echo "  flash-live-remote halos.local image.img.xz" >&2
-  echo "  flash-live-remote pi@192.168.1.100 image.img" >&2
+  echo "  flash-live-remote --stream pi@192.168.1.100 image.img" >&2
   echo "" >&2
   echo "Prerequisites:" >&2
-  echo "  Local:  ncat (from nmap), ssh" >&2
-  echo "  Target: busybox (with nc applet), SSH access" >&2
+  echo "  Local:  ssh, scp, xzcat/zcat (for compressed images)" >&2
+  echo "  Target: busybox, SSH access" >&2
   exit 1
 fi
 
 host="$1"
 image="$2"
-data_port=9999
-signal_port=9998
 
 # Validate image file exists
 if [ ! -f "$image" ]; then
@@ -39,7 +58,7 @@ if [ ! -f "$image" ]; then
   exit 1
 fi
 
-# Determine decompression command
+# Determine decompression command based on format
 decompress_cmd=""
 case "$image" in
   *.img.xz) decompress_cmd="xzcat" ;;
@@ -51,7 +70,34 @@ case "$image" in
     ;;
 esac
 
-_require ssh ncat "$decompress_cmd"
+# Fixed remote filename avoids shell metacharacter issues with scp/ssh.
+# The extension is preserved so the helper knows how to decompress.
+case "$image" in
+  *.img.xz) remote_image="/dev/shm/flash-image.img.xz" ;;
+  *.img.gz) remote_image="/dev/shm/flash-image.img.gz" ;;
+  *.img)    remote_image="/dev/shm/flash-image.img" ;;
+esac
+
+# Get compressed (on-disk) file size
+image_size=$(stat -f%z "$image" 2>/dev/null || stat -c%s "$image" 2>/dev/null || true)
+if [ -z "$image_size" ]; then
+  echo "Error: could not determine image file size" >&2
+  exit 1
+fi
+image_size_mb=$((image_size / 1048576))
+
+size_label="on-disk"
+if [[ "$image" == *.img.xz ]] || [[ "$image" == *.img.gz ]]; then
+  size_label="compressed"
+fi
+
+# Mode-specific local prerequisites
+_require ssh scp
+if [ "$mode" = "stream" ]; then
+  _require "$decompress_cmd"
+fi
+
+# --- Phase 0: Resolve hostname and detect target device ---
 
 echo "=== Phase 0: Resolving hostname and checking target ==="
 
@@ -61,17 +107,7 @@ if ! ssh -n "$host" "command -v busybox" >/dev/null 2>&1; then
   exit 1
 fi
 
-target_ip=$(ssh -n "$host" "hostname -I | awk '{print \$1}'")
-if [ -z "$target_ip" ]; then
-  echo "Error: could not resolve IP for $host" >&2
-  exit 1
-fi
-echo "Resolved $host -> $target_ip"
-
-echo ""
-echo "=== Phase 1: Preparing target ==="
-
-# Detect root block device using lsblk PKNAME (parent kernel name)
+# Detect root block device
 root_part=$(ssh -n "$host" "findmnt -no SOURCE /")
 if [ -z "$root_part" ]; then
   echo "Error: could not detect root partition" >&2
@@ -85,7 +121,6 @@ if [ -z "$root_dev" ]; then
 fi
 root_dev="/dev/$root_dev"
 
-# Validate the device exists
 if ! ssh -n "$host" "test -b '$root_dev'"; then
   echo "Error: $root_dev is not a valid block device on $host" >&2
   exit 1
@@ -94,23 +129,40 @@ fi
 dev_size=$(ssh -n "$host" "lsblk -bno SIZE '$root_dev' | head -1")
 dev_size_gb=$((dev_size / 1073741824))
 
-image_size=$(stat -f%z "$image" 2>/dev/null || stat -c%s "$image" 2>/dev/null || true)
-if [ -z "$image_size" ]; then
-  echo "Error: could not determine image file size" >&2
-  exit 1
-fi
-image_size_mb=$((image_size / 1048576))
+# Mode-specific preflight checks
+if [ "$mode" = "ramfs" ]; then
+  # Check /dev/shm capacity (trim whitespace from df output)
+  shm_avail=$(ssh -n "$host" "df -B1 --output=avail /dev/shm | tail -1 | tr -d ' '")
+  shm_avail_mb=$((shm_avail / 1048576))
+  margin_bytes=209715200  # 200 MB
+  required=$((image_size + margin_bytes))
+  if [ "$shm_avail" -lt "$required" ]; then
+    echo "Error: insufficient space in /dev/shm on target" >&2
+    echo "  Available: ${shm_avail_mb} MB" >&2
+    echo "  Required:  $((required / 1048576)) MB (image + 200 MB margin)" >&2
+    echo "" >&2
+    echo "Try --stream mode for low-memory devices." >&2
+    exit 1
+  fi
+  echo "Target /dev/shm: ${shm_avail_mb} MB available (need ${image_size_mb} MB + margin)"
 
-size_label="on-disk"
-if [[ "$image" == *.img.xz ]] || [[ "$image" == *.img.gz ]]; then
-  size_label="compressed"
+  # Check decompression tool on target
+  if [ "$decompress_cmd" != "cat" ]; then
+    if ! ssh -n "$host" "command -v $decompress_cmd" >/dev/null 2>&1; then
+      echo "Error: $decompress_cmd not found on $host (required for decompression)" >&2
+      exit 1
+    fi
+  fi
 fi
+
+# --- Confirmation prompt ---
 
 echo ""
+echo "  Mode: $mode"
 echo "  Target device: $root_dev (~${dev_size_gb} GB)"
 echo "  Root partition: $root_part"
 echo "  Image file: $image (${image_size_mb} MB ${size_label})"
-echo "  Target host: $host ($target_ip)"
+echo "  Target host: $host"
 echo ""
 echo "WARNING: This will ERASE ALL DATA on $root_dev on $host."
 echo "The device will be unreachable during flashing and will reboot when done."
@@ -121,107 +173,145 @@ if [ "$confirm" != "yes" ]; then
   exit 1
 fi
 
-echo ""
-echo "Copying flash helper to target..."
+# --- Ramfs mode ---
 
-# Helper script flow:
-#   1. Stop services
-#   2. Handshake with client on signal port (safe to abort here)
-#   3. Start busybox nc | dd listener on data port
-#   4. dd writes to raw block device (bypasses mounted filesystem)
-#   5. After transfer: sync, reboot -f
-ssh "$host" "cat > /dev/shm/flash-helper.sh" <<'HELPER_EOF'
+flash_ramfs() {
+  echo ""
+  echo "=== Phase 1: Copying image to target ==="
+
+  echo "Copying image to /dev/shm on target..."
+  scp -O "$image" "$host:$remote_image"
+
+  # Verify file size matches
+  remote_size=$(ssh -n "$host" "stat -c%s '$remote_image'")
+  if [ "$remote_size" != "$image_size" ]; then
+    echo "Error: size mismatch after transfer" >&2
+    echo "  Local:  $image_size bytes" >&2
+    echo "  Remote: $remote_size bytes" >&2
+    echo "Cleaning up remote file..."
+    ssh -n "$host" "rm -f '$remote_image'"
+    exit 1
+  fi
+  echo "Transfer verified: $remote_size bytes"
+
+  echo ""
+  echo "=== Phase 2: Flashing image ==="
+
+  echo "Stopping services on target..."
+  ssh -n "$host" "sudo systemctl stop 'container-*' 'marine-*' 'halos-*' cockpit docker 2>/dev/null || true; sync"
+
+  # Deploy helper script — passes all variable values as arguments to avoid
+  # shell metacharacter issues with filenames expanded into the heredoc.
+  ssh "$host" "cat > /dev/shm/flash-helper.sh" <<'HELPER_EOF'
 #!/bin/bash
 set -eo pipefail
 
-TARGET_DEV="$1"
-DATA_PORT="$2"
-SIGNAL_PORT="$3"
+IMAGE_PATH="$1"
+TARGET_DEV="$2"
+DECOMPRESS_CMD="$3"
 
-# Resolve binary paths now — after dd overwrites the disk, PATH lookups
+# Resolve all binary paths now — after dd overwrites the disk, PATH lookups
+# against the rootfs may fail (page cache eviction under memory pressure).
+BUSYBOX=$(command -v busybox)
+DD=$(command -v dd)
+DECOMPRESS=$(command -v "$DECOMPRESS_CMD")
+
+# Reboot on exit — if decompression fails before dd, the old image is intact
+# and the device recovers. If dd fails mid-write, the device is bricked either
+# way but at least it reboots so the user knows something happened.
+trap '"$BUSYBOX" reboot -f' EXIT
+
+echo "flash-helper: decompressing and writing $IMAGE_PATH -> $TARGET_DEV"
+"$DECOMPRESS" "$IMAGE_PATH" | "$DD" of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
+echo "flash-helper: dd complete:"
+"$BUSYBOX" cat /dev/shm/dd-status 2>/dev/null || true
+
+"$BUSYBOX" rm -f "$IMAGE_PATH"
+
+# EXIT trap handles reboot -f (skips sync so old rootfs cache doesn't
+# write back over the new image).
+echo "flash-helper: rebooting..."
+HELPER_EOF
+
+  ssh -n "$host" "chmod +x /dev/shm/flash-helper.sh"
+
+  echo "Launching flash helper on target..."
+  ssh -n "$host" "sudo setsid /dev/shm/flash-helper.sh '$remote_image' '$root_dev' '$decompress_cmd' </dev/null >/dev/shm/flash-helper.log 2>&1 &"
+
+  echo ""
+  echo "Image is being flashed on the target device."
+  echo "The device will reboot automatically when done."
+  echo ""
+  echo "Wait ~60s then try: ssh $host"
+}
+
+# --- Stream mode ---
+
+flash_stream() {
+  echo ""
+  echo "=== Phase 1: Preparing target ==="
+
+  # Deploy helper script — reads image data from stdin (piped via SSH),
+  # writes to block device, then reboots.
+  ssh "$host" "cat > /dev/shm/flash-helper.sh" <<'HELPER_EOF'
+#!/bin/bash
+
+TARGET_DEV="$1"
+
+# Resolve all binary paths now — after dd overwrites the disk, PATH lookups
 # against the rootfs may fail (page cache eviction under memory pressure).
 BUSYBOX=$(command -v busybox)
 DD=$(command -v dd)
 
-echo "flash-helper: starting (target=$TARGET_DEV, data=$DATA_PORT, signal=$SIGNAL_PORT)"
+# Reboot when done (or on failure) — once dd starts, the rootfs is destroyed.
+trap '"$BUSYBOX" reboot -f' EXIT
 
-# Stop services
-echo "flash-helper: stopping services..."
-systemctl stop 'container-*' 'marine-*' 'halos-*' cockpit docker 2>/dev/null || true
-sync
-
-# --- Handshake: signal readiness and wait for client confirmation ---
-# This happens BEFORE any destructive action so the device can recover if the client aborts.
-echo "flash-helper: signaling ready on port $SIGNAL_PORT..."
-REPLY=$(echo "READY" | "$BUSYBOX" nc -l -p "$SIGNAL_PORT" -w 60)
-if [ "$REPLY" != "GO" ]; then
-  echo "flash-helper: client did not confirm (got '$REPLY'), aborting"
-  echo "flash-helper: rebooting to restore services..."
-  reboot
-  exit 1
-fi
-echo "flash-helper: client confirmed, starting listener"
-
-# --- Start nc|dd listener and wait for transfer ---
-echo "flash-helper: starting nc|dd listener on port $DATA_PORT -> $TARGET_DEV"
-"$BUSYBOX" nc -l -p "$DATA_PORT" | "$DD" of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
-echo "flash-helper: dd complete, status:"
-cat /dev/shm/dd-status 2>/dev/null || true
-sync
-
-echo "flash-helper: rebooting..."
-"$BUSYBOX" reboot -f
+echo "flash-helper: writing stdin -> $TARGET_DEV"
+"$DD" of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
+"$BUSYBOX" cat /dev/shm/dd-status 2>/dev/null || true
+echo "flash-helper: dd complete, rebooting..."
 HELPER_EOF
 
-ssh -n "$host" "chmod +x /dev/shm/flash-helper.sh"
+  ssh -n "$host" "chmod +x /dev/shm/flash-helper.sh"
 
-echo "Launching flash helper on target..."
-# Use setsid to fully detach from SSH session, preventing SIGHUP on disconnect
-ssh -n "$host" "sudo setsid /dev/shm/flash-helper.sh '$root_dev' '$data_port' '$signal_port' </dev/null >/dev/shm/flash-helper.log 2>&1 &"
+  echo "Stopping services on target..."
+  ssh -n "$host" "sudo systemctl stop 'container-*' 'marine-*' 'halos-*' cockpit docker 2>/dev/null || true; sync"
 
-echo ""
-echo "=== Phase 2: Streaming image ==="
+  echo ""
+  echo "=== Phase 2: Streaming image ==="
 
-# Handshake: wait for helper to signal readiness on signal port
-echo "Waiting for target to be ready..."
-retries=0
-max_retries=30
-while true; do
-  reply=$(echo "GO" | ncat "$target_ip" "$signal_port" 2>/dev/null) || true
-  if [ "$reply" = "READY" ]; then
-    echo "Target is ready, confirmed handshake."
-    break
-  fi
-  retries=$((retries + 1))
-  if [ "$retries" -ge "$max_retries" ]; then
-    echo "Error: target not ready after ${max_retries}s" >&2
-    echo "The device should still be recoverable (no destructive action was taken)." >&2
+  start_time=$(date +%s)
+
+  echo "Streaming image via SSH..."
+  # SSH connection drops when the target reboots after dd — that's expected.
+  # Disable errexit to capture PIPESTATUS and distinguish decompression
+  # failures (real error) from SSH connection drops (expected).
+  set +eo pipefail
+  # shellcheck disable=SC2029  # $root_dev is intentionally expanded client-side
+  "$decompress_cmd" "$image" | ssh "$host" "sudo /dev/shm/flash-helper.sh '$root_dev'"
+  decompress_exit=${PIPESTATUS[0]}
+  set -eo pipefail
+
+  end_time=$(date +%s)
+  elapsed_s=$((end_time - start_time))
+
+  if [ "$decompress_exit" -ne 0 ]; then
+    echo ""
+    echo "Error: decompression failed (exit code $decompress_exit)." >&2
+    echo "The target device may be in an inconsistent state." >&2
     exit 1
   fi
-  sleep 1
-  printf "."
-done
 
-# The data port listener starts immediately after the handshake completes.
-# Give it a moment to bind before connecting.
-sleep 2
+  echo ""
+  echo "Transfer complete (${elapsed_s}s)."
+  echo "The device will reboot automatically."
+  echo ""
+  echo "Wait ~60s then try: ssh $host"
+}
 
-start_time=$(date +%s)
+# --- Dispatch ---
 
-echo "Streaming image..."
-if ! "$decompress_cmd" "$image" | ncat --send-only "$target_ip" "$data_port"; then
-  echo "" >&2
-  echo "Error: transfer failed." >&2
-  echo "The device may have a partial image. It will attempt to sync and reboot." >&2
-  echo "If it doesn't come back, manual re-flash is needed." >&2
-  exit 1
-fi
-
-end_time=$(date +%s)
-elapsed_s=$((end_time - start_time))
-
-echo ""
-echo "Image transfer complete (${elapsed_s}s)."
-echo "The device is syncing and will reboot automatically."
-echo ""
-echo "Wait ~60s then try: ssh $host"
+case "$mode" in
+  ramfs)  flash_ramfs ;;
+  stream) flash_stream ;;
+esac
