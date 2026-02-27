@@ -10,17 +10,64 @@ _require() {
   done
 }
 
+# --- Config file parser ---
+
+parse_config() {
+  local config_file="$1"
+  if [ ! -f "$config_file" ]; then
+    echo "Error: config file not found: $config_file" >&2
+    exit 1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Skip blank lines and comments
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    # Trim whitespace from key
+    key=$(echo "$key" | tr -d '[:space:]')
+    # Expand leading ~/ to $HOME/ (shell doesn't expand tildes in file content)
+    value="${value/#\~\//$HOME/}"
+    case "$key" in
+      hostname)      custom_hostname="$value" ;;
+      user)          custom_user="$value" ;;
+      password)      custom_password="$value" ;;
+      ssh-key)       custom_ssh_keys+=("$value") ;;
+      wifi-ssid)     wifi_ssid="$value" ;;
+      wifi-password) wifi_password="$value" ;;
+      wifi-country)  wifi_country="$value" ;;
+      *)
+        echo "Error: unknown config key '$key' in $config_file" >&2
+        exit 1
+        ;;
+    esac
+  done < "$config_file"
+}
+
 # --- Argument parsing ---
 
 mode="ramfs"
+custom_hostname=""
+custom_user=""
+custom_password=""
+custom_ssh_keys=()
+wifi_ssid=""
+wifi_password=""
+wifi_country="GB"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --ramfs)  mode="ramfs";  shift ;;
     --stream) mode="stream"; shift ;;
+    --config)
+      if [ $# -lt 2 ]; then
+        echo "Error: --config requires a file path" >&2
+        exit 1
+      fi
+      parse_config "$2"; shift 2 ;;
     -*)
       echo "Error: unknown option '$1'" >&2
       echo "" >&2
-      echo "Usage: flash-live-remote [--ramfs|--stream] <host> <image>" >&2
+      echo "Usage: flash-live-remote [--ramfs|--stream] [--config FILE] <host> <image>" >&2
       exit 1
       ;;
     *) break ;;
@@ -28,24 +75,31 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ $# -lt 2 ]; then
-  echo "Usage: flash-live-remote [--ramfs|--stream] <host> <image>" >&2
+  echo "Usage: flash-live-remote [--ramfs|--stream] [--config FILE] <host> <image>" >&2
   echo "" >&2
   echo "Flash an image to a remote Linux device over the network." >&2
   echo "The device must be running and accessible via SSH." >&2
   echo "" >&2
   echo "Modes:" >&2
-  echo "  --ramfs   (default) scp image to /dev/shm, then decompress+dd locally" >&2
-  echo "  --stream  Stream image directly over SSH (for low-memory devices)" >&2
+  echo "  --ramfs            (default) scp image to /dev/shm, then decompress+dd locally" >&2
+  echo "  --stream           Stream image directly over SSH (for low-memory devices)" >&2
+  echo "" >&2
+  echo "First-boot customization:" >&2
+  echo "  --config FILE      Config file with key=value settings for first-boot customization." >&2
+  echo "                     See example.conf for available keys and format." >&2
+  echo "                     Requires the new image to have the same partition layout as the" >&2
+  echo "                     running image (boot partition = partition 1)." >&2
   echo "" >&2
   echo "Supported formats: .img, .img.xz, .img.gz" >&2
   echo "" >&2
   echo "Examples:" >&2
   echo "  flash-live-remote halos.local image.img.xz" >&2
+  echo "  flash-live-remote --config myboat.conf halos.local image.img.xz" >&2
   echo "  flash-live-remote --stream pi@192.168.1.100 image.img" >&2
   echo "" >&2
   echo "Prerequisites:" >&2
   echo "  Local:  ssh, scp, xzcat/zcat (for compressed images)" >&2
-  echo "  Target: busybox, SSH access" >&2
+  echo "  Target: busybox (with mount, umount applets for customization)" >&2
   exit 1
 fi
 
@@ -89,6 +143,125 @@ image_size_mb=$((image_size / 1048576))
 size_label="on-disk"
 if [[ "$image" == *.img.xz ]] || [[ "$image" == *.img.gz ]]; then
   size_label="compressed"
+fi
+
+# --- Validate customization flags ---
+
+if [ -n "$custom_hostname" ] && ! [[ "$custom_hostname" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
+  echo "Error: hostname must contain only alphanumeric characters and hyphens" >&2
+  exit 1
+fi
+if [ -n "$custom_user" ] && ! [[ "$custom_user" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+  echo "Error: username must be a valid Linux username (lowercase, alphanumeric, hyphens, underscores)" >&2
+  exit 1
+fi
+if [ -n "$wifi_country" ] && ! [[ "$wifi_country" =~ ^[A-Z]{2}$ ]]; then
+  echo "Error: wifi-country must be a 2-letter country code (e.g., GB, US, FI)" >&2
+  exit 1
+fi
+if [ -n "$wifi_ssid" ] && [ -z "$wifi_password" ]; then
+  echo "Error: wifi-ssid requires wifi-password" >&2
+  exit 1
+fi
+if [ -n "$wifi_password" ] && [ -z "$wifi_ssid" ]; then
+  echo "Error: wifi-password requires wifi-ssid" >&2
+  exit 1
+fi
+if [ -n "$custom_password" ] && [ -z "$custom_user" ]; then
+  echo "Error: password requires user" >&2
+  exit 1
+fi
+
+# If user given without explicit ssh-key, auto-detect local SSH public keys
+if [ -n "$custom_user" ] && [ ${#custom_ssh_keys[@]} -eq 0 ]; then
+  for pubkey in ~/.ssh/*.pub; do
+    [ -f "$pubkey" ] && custom_ssh_keys+=("$pubkey")
+  done
+fi
+
+if [ -n "$custom_user" ] && [ -z "$custom_password" ] && [ ${#custom_ssh_keys[@]} -eq 0 ]; then
+  echo "Warning: user set but no password or SSH keys found. User will have no authentication method." >&2
+  echo "  Add password or ssh-key to your config file, or place public keys in ~/.ssh/*.pub" >&2
+fi
+
+# If password given, hash it locally
+password_hash=""
+if [ -n "$custom_password" ]; then
+  _require openssl
+  password_hash=$(echo "$custom_password" | openssl passwd -6 -stdin)
+fi
+
+has_customization=false
+if [ -n "$custom_hostname" ] || [ -n "$custom_user" ] || [ -n "$wifi_ssid" ]; then
+  has_customization=true
+fi
+
+# --- Generate first-boot payloads ---
+# Follows the cloudinit-rpi format used by RPi Imager 2.x:
+# - user-data: cloud-init YAML with users: block, hostname, ssh_pwauth
+# - network-config: netplan YAML with eth0 + optional wlan0
+
+custom_user_data=""
+custom_network_config=""
+
+# Build user-data YAML matching RPi Imager's cloudinit-rpi format
+ud_lines=()
+ud_lines+=("#cloud-config")
+
+if [ -n "$custom_hostname" ]; then
+  ud_lines+=("hostname: $custom_hostname")
+  ud_lines+=("manage_etc_hosts: true")
+fi
+
+if [ -n "$custom_user" ]; then
+  # Read SSH public keys
+  ssh_key_lines=()
+  for keyfile in "${custom_ssh_keys[@]}"; do
+    if [ ! -f "$keyfile" ]; then
+      echo "Error: SSH key file not found: $keyfile" >&2
+      exit 1
+    fi
+    ssh_key_lines+=("$(head -1 "$keyfile")")
+  done
+
+  ud_lines+=("users:")
+  ud_lines+=("  - name: $custom_user")
+  ud_lines+=("    groups: users,adm,dialout,audio,netdev,video,plugdev,cdrom,games,input,gpio,spi,i2c,render,sudo")
+  ud_lines+=("    shell: /bin/bash")
+  ud_lines+=("    sudo: ALL=(ALL) NOPASSWD:ALL")
+  if [ -n "$password_hash" ]; then
+    ud_lines+=("    lock_passwd: false")
+    ud_lines+=("    passwd: $password_hash")
+  fi
+  if [ ${#ssh_key_lines[@]} -gt 0 ]; then
+    ud_lines+=("    ssh_authorized_keys:")
+    for key in "${ssh_key_lines[@]}"; do
+      ud_lines+=("      - $key")
+    done
+  fi
+  ud_lines+=("enable_ssh: true")
+  ud_lines+=("ssh_pwauth: true")
+fi
+
+# Only produce user-data if there's more than just the #cloud-config header
+if [ ${#ud_lines[@]} -gt 1 ]; then
+  custom_user_data=$(printf '%s\n' "${ud_lines[@]}")
+fi
+
+if [ -n "$wifi_ssid" ]; then
+  # cloud-init treats network-config as the complete network definition,
+  # so we must include eth0 — otherwise wired ethernet loses DHCP.
+  custom_network_config="network:
+  version: 2
+  wifis:
+    renderer: NetworkManager
+    wlan0:
+      dhcp4: true
+      regulatory-domain: \"$wifi_country\"
+      access-points:
+        \"$wifi_ssid\":
+          password: \"$wifi_password\"
+      optional: true"
 fi
 
 # Mode-specific local prerequisites
@@ -155,6 +328,17 @@ if [ "$mode" = "ramfs" ]; then
   fi
 fi
 
+# Preflight checks for customization capabilities on target
+if [ "$has_customization" = true ]; then
+  echo "Checking customization prerequisites on target..."
+
+  # Verify kernel supports vfat
+  if ! ssh -n "$host" "grep -q vfat /proc/filesystems"; then
+    echo "Error: kernel on $host lacks vfat support (required for customization)" >&2
+    exit 1
+  fi
+fi
+
 # --- Confirmation prompt ---
 
 echo ""
@@ -163,6 +347,18 @@ echo "  Target device: $root_dev (~${dev_size_gb} GB)"
 echo "  Root partition: $root_part"
 echo "  Image file: $image (${image_size_mb} MB ${size_label})"
 echo "  Target host: $host"
+if [ "$has_customization" = true ]; then
+  echo ""
+  echo "  First-boot customization:"
+  [ -n "$custom_hostname" ] && echo "    Hostname: $custom_hostname"
+  if [ -n "$custom_user" ]; then
+    user_info="$custom_user"
+    [ -n "$custom_password" ] && user_info+=" (with password)"
+    [ ${#custom_ssh_keys[@]} -gt 0 ] && user_info+=" (with ${#custom_ssh_keys[@]} SSH key(s))"
+    echo "    User: $user_info"
+  fi
+  [ -n "$wifi_ssid" ] && echo "    WiFi: $wifi_ssid (country: $wifi_country)"
+fi
 echo ""
 echo "WARNING: This will ERASE ALL DATA on $root_dev on $host."
 echo "The device will be unreachable during flashing and will reboot when done."
@@ -171,6 +367,19 @@ read -r -p "Type 'yes' to proceed: " confirm
 if [ "$confirm" != "yes" ]; then
   echo "Aborted."
   exit 1
+fi
+
+# Transfer customization payloads to target (after confirmation to avoid
+# leaving sensitive data on target if the user aborts)
+if [ "$has_customization" = true ]; then
+  echo ""
+  echo "Transferring customization payloads..."
+  if [ -n "$custom_user_data" ]; then
+    echo "$custom_user_data" | ssh "$host" "cat > /dev/shm/custom-user-data"
+  fi
+  if [ -n "$custom_network_config" ]; then
+    echo "$custom_network_config" | ssh "$host" "cat > /dev/shm/custom-network-config"
+  fi
 fi
 
 # --- Ramfs mode ---
@@ -228,6 +437,35 @@ echo "flash-helper: dd complete:"
 
 "$BUSYBOX" rm -f "$IMAGE_PATH"
 
+# Apply first-boot customization if payload files were transferred.
+# Errors here must not abort — the image is already flashed successfully,
+# so we want to reboot regardless.
+if [ -f /dev/shm/custom-user-data ] || [ -f /dev/shm/custom-network-config ]; then
+  echo "flash-helper: applying first-boot customization..."
+
+  # Determine boot partition device name (mmcblk0p1 vs sda1).
+  # The kernel's old partition nodes are still valid — dd wrote a new
+  # partition table with the same layout, and the kernel keeps the stale
+  # entries until reboot. No blockdev --rereadpt needed (and it would
+  # fail anyway since the rootfs partition is still "in use").
+  BOOT_PART="${TARGET_DEV}p1"
+  "$BUSYBOX" test -b "$BOOT_PART" || BOOT_PART="${TARGET_DEV}1"
+
+  "$BUSYBOX" mkdir -p /dev/shm/bootmnt
+  if "$BUSYBOX" mount -t vfat "$BOOT_PART" /dev/shm/bootmnt; then
+    [ -f /dev/shm/custom-user-data ] && \
+      "$BUSYBOX" cp /dev/shm/custom-user-data /dev/shm/bootmnt/user-data
+    [ -f /dev/shm/custom-network-config ] && \
+      "$BUSYBOX" cp /dev/shm/custom-network-config /dev/shm/bootmnt/network-config
+    # umount flushes FAT32 data. No explicit sync — a global sync would risk
+    # writing back old rootfs dirty pages over the new image.
+    "$BUSYBOX" umount /dev/shm/bootmnt
+    echo "flash-helper: boot partition customization applied"
+  else
+    echo "flash-helper: ERROR: could not mount boot partition for customization"
+  fi
+fi
+
 # EXIT trap handles reboot -f (skips sync so old rootfs cache doesn't
 # write back over the new image).
 echo "flash-helper: rebooting..."
@@ -269,7 +507,30 @@ trap '"$BUSYBOX" reboot -f' EXIT
 echo "flash-helper: writing stdin -> $TARGET_DEV"
 "$DD" of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
 "$BUSYBOX" cat /dev/shm/dd-status 2>/dev/null || true
-echo "flash-helper: dd complete, rebooting..."
+echo "flash-helper: dd complete"
+
+# Apply first-boot customization if payload files were transferred
+if [ -f /dev/shm/custom-user-data ] || [ -f /dev/shm/custom-network-config ]; then
+  echo "flash-helper: applying first-boot customization..."
+
+  # See ramfs helper for explanation of why blockdev --rereadpt is skipped.
+  BOOT_PART="${TARGET_DEV}p1"
+  "$BUSYBOX" test -b "$BOOT_PART" || BOOT_PART="${TARGET_DEV}1"
+
+  "$BUSYBOX" mkdir -p /dev/shm/bootmnt
+  if "$BUSYBOX" mount -t vfat "$BOOT_PART" /dev/shm/bootmnt; then
+    [ -f /dev/shm/custom-user-data ] && \
+      "$BUSYBOX" cp /dev/shm/custom-user-data /dev/shm/bootmnt/user-data
+    [ -f /dev/shm/custom-network-config ] && \
+      "$BUSYBOX" cp /dev/shm/custom-network-config /dev/shm/bootmnt/network-config
+    "$BUSYBOX" umount /dev/shm/bootmnt
+    echo "flash-helper: boot partition customization applied"
+  else
+    echo "flash-helper: ERROR: could not mount boot partition for customization"
+  fi
+fi
+
+echo "flash-helper: rebooting..."
 HELPER_EOF
 
   ssh -n "$host" "chmod +x /dev/shm/flash-helper.sh"

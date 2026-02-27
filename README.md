@@ -7,9 +7,10 @@ Flash a Linux SBC over the network while it's running. Transfers a disk image fr
 **Local (dev machine):**
 - `ssh`, `scp`
 - `xzcat` / `zcat` (for compressed images)
+- `openssl` (only if using `password` in config)
 
 **Target device:**
-- `busybox`
+- `busybox` (with `blockdev`, `mount`, `umount` applets if using customization)
 - SSH access
 - Linux with `systemd`, `findmnt`, `lsblk`, `dd`
 - Ramfs mode: enough RAM in `/dev/shm` to hold the compressed image (~4 GB+ devices)
@@ -31,10 +32,52 @@ chmod +x /usr/local/bin/flash-live-remote
 ## Usage
 
 ```bash
-flash-live-remote [--ramfs|--stream] <host> <image>
+flash-live-remote [--ramfs|--stream] [--config FILE] <host> <image>
 ```
 
 Supported image formats: `.img`, `.img.xz`, `.img.gz`
+
+### First-boot customization
+
+Use `--config FILE` to pre-configure the flashed image via cloud-init. The config file uses simple `key=value` format — see `example.conf` for all available keys.
+
+```bash
+# Flash with customization
+flash-live-remote --config myboat.conf halos.local image.img.xz
+
+# Plain flash, no customization
+flash-live-remote halos.local image.img.xz
+```
+
+Config file format:
+
+```ini
+# myboat.conf
+hostname=myboat
+user=mairas
+password=secret123
+ssh-key=~/.ssh/id_ed25519.pub
+ssh-key=~/.ssh/id_rsa.pub
+wifi-ssid=MyNetwork
+wifi-password=MyPass
+wifi-country=FI
+```
+
+| Key | Description |
+|---|---|
+| `hostname` | Set system hostname |
+| `user` | Set username (replaces default 'pi') |
+| `password` | Set user password (hashed locally with `openssl passwd -6`) |
+| `ssh-key` | SSH public key file (repeatable; defaults to `~/.ssh/*.pub` if `user` is set) |
+| `wifi-ssid` | WiFi network name (requires `wifi-password`) |
+| `wifi-password` | WiFi password (requires `wifi-ssid`) |
+| `wifi-country` | WiFi regulatory domain (default: `GB`) |
+
+Tilde (`~/`) in `ssh-key` paths is expanded automatically. The `ssh-key` key can appear multiple times to add multiple keys.
+
+After `dd` completes, the helper mounts the boot partition (FAT32, partition 1) and writes `user-data` and/or `network-config` files for cloud-init. If no config file is given, behavior is identical to a plain flash.
+
+**Important:** Customization assumes the new image has the same partition layout as the currently running image (boot partition = partition 1). After `dd`, the kernel cannot re-read the partition table because the old rootfs is still "in use", so the helper mounts using the pre-existing partition device node. If the new image has a different partition layout, do not use `--config` — flash without customization and configure manually after first boot.
 
 ### Ramfs mode (default)
 
@@ -65,6 +108,8 @@ Dev machine                               Target (Linux SBC)
 ───────────                               ──────────────────
 Phase 0: SSH ──────────────────────────── Detect root block device
          SSH ──────────────────────────── Check /dev/shm capacity, xzcat/zcat
+         SSH ──────────────────────────── Check customization prerequisites*
+         SSH ──────────────────────────── Transfer cloud-init payloads*
          Confirm with user
 Phase 1: scp image.img.xz ─────────────── /dev/shm/image.img.xz
          SSH ──────────────────────────── Verify file size matches
@@ -72,8 +117,10 @@ Phase 2: SSH ──────────────────────�
          SSH ──────────────────────────── Deploy helper to /dev/shm
          SSH ──────────────────────────── Launch helper (detached)
                                           Helper: xzcat /dev/shm/image | dd
-                                          Helper: rm image, reboot -f
+                                          Helper: mount boot, write cloud-init*
+                                          Helper: reboot -f
 ```
+*Only when --config is provided.
 
 ### Stream mode
 
@@ -81,12 +128,16 @@ Phase 2: SSH ──────────────────────�
 Dev machine                               Target (Linux SBC)
 ───────────                               ──────────────────
 Phase 0: SSH ──────────────────────────── Detect root block device
+         SSH ──────────────────────────── Check customization prerequisites*
+         SSH ──────────────────────────── Transfer cloud-init payloads*
          Confirm with user
 Phase 1: SSH ──────────────────────────── Deploy helper to /dev/shm
          SSH ──────────────────────────── Stop services, sync
 Phase 2: xzcat | ssh "dd of=/dev/..." ──── dd writes to block device
+                                          Helper: mount boot, write cloud-init*
                                           Helper: reboot -f (via EXIT trap)
 ```
+*Only when --config is provided.
 
 ### Key design decisions
 
@@ -95,6 +146,7 @@ Phase 2: xzcat | ssh "dd of=/dev/..." ──── dd writes to block device
 - **No pivot_root or unmount**: `dd` writes to the raw block device, bypassing the mounted filesystem. `reboot -f` skips sync so the old filesystem cache doesn't write back.
 - **Resolved binary paths**: After dd overwrites the disk, PATH lookups against the rootfs may fail (page cache eviction). All helpers resolve binary paths (busybox, dd) before dd starts.
 - **EXIT trap (stream mode)**: The helper uses `trap 'busybox reboot -f' EXIT` to ensure reboot happens even if the SSH session drops during or after the write.
+- **Config file over flags**: Passwords stay in a file (not visible in `ps` or shell history), and settings are written once and reused across flashes.
 
 ## Choosing a mode
 
