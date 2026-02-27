@@ -1,18 +1,19 @@
 # flash-live-remote
 
-Flash a Linux SBC over the network while it's running. Streams a disk image from your development machine to a remote device, overwrites its boot device, and reboots into the new image.
+Flash a Linux SBC over the network while it's running. Transfers a disk image from your development machine to a remote device, overwrites its boot device, and reboots into the new image.
 
 ## Prerequisites
 
 **Local (dev machine):**
-- `ncat` (from nmap: `brew install nmap` on macOS, `apt install ncat` on Debian)
-- `ssh`
+- `ssh`, `scp`
 - `xzcat` / `zcat` (for compressed images)
 
 **Target device:**
-- `busybox` (with `nc` applet)
+- `busybox`
 - SSH access
 - Linux with `systemd`, `findmnt`, `lsblk`, `dd`
+- Ramfs mode: enough RAM in `/dev/shm` to hold the compressed image (~4 GB+ devices)
+- Ramfs mode: `xzcat` / `zcat` (for compressed images — present by default on Raspberry Pi OS)
 
 ## Installation
 
@@ -30,49 +31,88 @@ chmod +x /usr/local/bin/flash-live-remote
 ## Usage
 
 ```bash
-flash-live-remote <host> <image>
+flash-live-remote [--ramfs|--stream] <host> <image>
 ```
 
 Supported image formats: `.img`, `.img.xz`, `.img.gz`
 
+### Ramfs mode (default)
+
+Copies the compressed image to the target's `/dev/shm` via scp, then decompresses and writes it locally. This is the safest mode — if the transfer fails, no destructive action has happened.
+
 ```bash
-# Flash a compressed image
+# Default ramfs mode
 flash-live-remote halos.local ~/images/halos-marine.img.xz
 
-# Flash an uncompressed image
-flash-live-remote pi@192.168.1.100 image.img
+# Explicit ramfs mode
+flash-live-remote --ramfs halos.local ~/images/halos-marine.img.xz
+```
+
+### Stream mode
+
+Decompresses locally and streams the uncompressed image over SSH. Uses no extra RAM on the target but has no pre-flash integrity check — if the transfer fails mid-stream, the device has a partial image.
+
+```bash
+flash-live-remote --stream pi@192.168.1.100 image.img.xz
 ```
 
 ## How it works
 
+### Ramfs mode
+
 ```
 Dev machine                               Target (Linux SBC)
 ───────────                               ──────────────────
-Phase 0: SSH ──────────────────────────── Resolve IP, check busybox
-Phase 1: SSH ──────────────────────────── Detect root block device
-         SSH ──────────────────────────── Copy helper script to /dev/shm
+Phase 0: SSH ──────────────────────────── Detect root block device
+         SSH ──────────────────────────── Check /dev/shm capacity, xzcat/zcat
+         Confirm with user
+Phase 1: scp image.img.xz ─────────────── /dev/shm/image.img.xz
+         SSH ──────────────────────────── Verify file size matches
+Phase 2: SSH ──────────────────────────── Stop services, sync
+         SSH ──────────────────────────── Deploy helper to /dev/shm
          SSH ──────────────────────────── Launch helper (detached)
-                                          Helper: stop services, sync
-                                          Helper: listen on signal port 9998
-Phase 2: ncat ── "GO" / "READY" ──────── Handshake (no destructive action yet)
-                                          Helper: listen on data port 9999
-         xzcat | ncat --send-only ─────── dd writes to raw block device
-                                          Helper: sync, reboot -f
+                                          Helper: xzcat /dev/shm/image | dd
+                                          Helper: rm image, reboot -f
+```
+
+### Stream mode
+
+```
+Dev machine                               Target (Linux SBC)
+───────────                               ──────────────────
+Phase 0: SSH ──────────────────────────── Detect root block device
+         Confirm with user
+Phase 1: SSH ──────────────────────────── Deploy helper to /dev/shm
+         SSH ──────────────────────────── Stop services, sync
+Phase 2: xzcat | ssh "dd of=/dev/..." ──── dd writes to block device
+                                          Helper: reboot -f (via EXIT trap)
 ```
 
 ### Key design decisions
 
-- **`ncat` (from nmap), not macOS `nc`**: macOS `nc` doesn't close the TCP connection when stdin reaches EOF, causing the transfer to hang indefinitely. `ncat --send-only` closes correctly.
-- **Two-port handshake**: A signal port (9998) confirms bidirectional connectivity *before* any destructive action. If the handshake fails, the helper reboots to restore services. The device is always recoverable at this point.
-- **`busybox nc` on target**: busybox `nc -l` accepts exactly one connection then exits. Never probe with `nc -z` — the probe consumes the listener.
-- **No pivot_root or unmount**: `dd` writes to the raw block device, bypassing the mounted filesystem. `reboot -f` skips sync so the old filesystem cache doesn't write back. Much simpler than unmounting root.
-- **Hostname resolved to IP early**: mDNS (`.local`) resolution fails after avahi is stopped. The target's IP is captured via SSH before services are stopped.
+- **Ramfs mode is default**: scp provides a progress bar and pre-flash integrity check (file size verification). If the transfer fails, no destructive action has happened — the device is fully recoverable.
+- **Stream mode uses SSH as transport**: The decompressed image is piped directly through SSH (`xzcat | ssh host "dd ..."`). SSH handles flow control, buffering, and connection lifecycle correctly. When xzcat finishes, SSH sends EOF, dd gets EOF and exits. No nc/ncat needed.
+- **No pivot_root or unmount**: `dd` writes to the raw block device, bypassing the mounted filesystem. `reboot -f` skips sync so the old filesystem cache doesn't write back.
+- **Resolved binary paths**: After dd overwrites the disk, PATH lookups against the rootfs may fail (page cache eviction). All helpers resolve binary paths (busybox, dd) before dd starts.
+- **EXIT trap (stream mode)**: The helper uses `trap 'busybox reboot -f' EXIT` to ensure reboot happens even if the SSH session drops during or after the write.
+
+## Choosing a mode
+
+| | Ramfs (default) | Stream |
+|---|---|---|
+| **Safety** | Pre-flash integrity check; no destructive action until verified | Transfer failure = partial image |
+| **Progress** | scp progress bar | None (dd reports at end) |
+| **RAM required** | Compressed image must fit in /dev/shm | Minimal |
+| **Speed** | Fast (local decompression + NVMe write) | Slower (network-bound for uncompressed data) |
+| **Local tools** | ssh, scp | ssh, xzcat/zcat |
+| **Target tools** | xzcat/zcat, busybox | busybox |
+
+Use `--stream` for devices with less than ~4 GB RAM where the compressed image won't fit in `/dev/shm`.
 
 ## Limitations
 
-- **If the transfer fails after the handshake**, the device has a partial image. It will attempt to reboot but may not come back — manual re-flash (SD card / NVMe adapter) is required.
+- **Stream mode**: If the transfer fails mid-stream, the device has a partial image and may need manual re-flash.
 - The helper script stops `container-*`, `marine-*`, `halos-*`, `cockpit`, and `docker` services. Adjust if your target runs different services.
-- Ports 9998 and 9999 are hardcoded.
 - Only tested with Raspberry Pi (HaLOS) but should work on any Linux SBC with the listed prerequisites.
 
 ## License
