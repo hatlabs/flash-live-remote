@@ -138,6 +138,11 @@ TARGET_DEV="$1"
 DATA_PORT="$2"
 SIGNAL_PORT="$3"
 
+# Resolve binary paths now — after dd overwrites the disk, PATH lookups
+# against the rootfs may fail (page cache eviction under memory pressure).
+BUSYBOX=$(command -v busybox)
+DD=$(command -v dd)
+
 echo "flash-helper: starting (target=$TARGET_DEV, data=$DATA_PORT, signal=$SIGNAL_PORT)"
 
 # Stop services
@@ -148,7 +153,7 @@ sync
 # --- Handshake: signal readiness and wait for client confirmation ---
 # This happens BEFORE any destructive action so the device can recover if the client aborts.
 echo "flash-helper: signaling ready on port $SIGNAL_PORT..."
-REPLY=$(echo "READY" | busybox nc -l -p "$SIGNAL_PORT" -w 60)
+REPLY=$(echo "READY" | "$BUSYBOX" nc -l -p "$SIGNAL_PORT" -w 60)
 if [ "$REPLY" != "GO" ]; then
   echo "flash-helper: client did not confirm (got '$REPLY'), aborting"
   echo "flash-helper: rebooting to restore services..."
@@ -159,13 +164,13 @@ echo "flash-helper: client confirmed, starting listener"
 
 # --- Start nc|dd listener and wait for transfer ---
 echo "flash-helper: starting nc|dd listener on port $DATA_PORT -> $TARGET_DEV"
-busybox nc -l -p "$DATA_PORT" | dd of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
+"$BUSYBOX" nc -l -p "$DATA_PORT" | "$DD" of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
 echo "flash-helper: dd complete, status:"
 cat /dev/shm/dd-status 2>/dev/null || true
 sync
 
 echo "flash-helper: rebooting..."
-reboot -f
+"$BUSYBOX" reboot -f
 HELPER_EOF
 
 ssh -n "$host" "chmod +x /dev/shm/flash-helper.sh"
