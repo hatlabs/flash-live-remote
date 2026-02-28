@@ -87,8 +87,6 @@ if [ $# -lt 2 ]; then
   echo "First-boot customization:" >&2
   echo "  --config FILE      Config file with key=value settings for first-boot customization." >&2
   echo "                     See example.conf for available keys and format." >&2
-  echo "                     Requires the new image to have the same partition layout as the" >&2
-  echo "                     running image (boot partition = partition 1)." >&2
   echo "" >&2
   echo "Supported formats: .img, .img.xz, .img.gz" >&2
   echo "" >&2
@@ -99,7 +97,7 @@ if [ $# -lt 2 ]; then
   echo "" >&2
   echo "Prerequisites:" >&2
   echo "  Local:  ssh, scp, xzcat/zcat (for compressed images)" >&2
-  echo "  Target: busybox (with mount, umount applets for customization)" >&2
+  echo "  Target: busybox (with fdisk, losetup, mount, umount applets for customization)" >&2
   exit 1
 fi
 
@@ -188,7 +186,7 @@ fi
 password_hash=""
 if [ -n "$custom_password" ]; then
   _require openssl
-  password_hash=$(echo "$custom_password" | openssl passwd -6 -stdin)
+  password_hash=$(printf '%s' "$custom_password" | openssl passwd -6 -stdin)
 fi
 
 has_customization=false
@@ -348,6 +346,14 @@ if [ "$has_customization" = true ]; then
     echo "Error: kernel on $host lacks vfat support (required for customization)" >&2
     exit 1
   fi
+
+  # Verify busybox has required applets for loop-mount boot partition
+  for applet in fdisk losetup; do
+    if ! ssh -n "$host" "busybox $applet --help" >/dev/null 2>&1; then
+      echo "Error: busybox on $host lacks $applet applet (required for customization)" >&2
+      exit 1
+    fi
+  done
 fi
 
 # --- Confirmation prompt ---
@@ -433,14 +439,20 @@ DECOMPRESS_CMD="$3"
 
 # Resolve all binary paths now — after dd overwrites the disk, PATH lookups
 # against the rootfs may fail (page cache eviction under memory pressure).
-BUSYBOX=$(command -v busybox)
+BUSYBOX_SRC=$(command -v busybox)
 DD=$(command -v dd)
 DECOMPRESS=$(command -v "$DECOMPRESS_CMD")
 
-# Reboot on exit — if decompression fails before dd, the old image is intact
-# and the device recovers. If dd fails mid-write, the device is bricked either
-# way but at least it reboots so the user knows something happened.
-trap '"$BUSYBOX" reboot -f' EXIT
+# Copy busybox to tmpfs — after dd, busybox's text pages can be evicted
+# from cache and the kernel will try to page them back from the overwritten
+# disk, causing SIGBUS. Tmpfs is RAM-backed so pages are never evicted.
+cp "$BUSYBOX_SRC" /dev/shm/busybox
+chmod +x /dev/shm/busybox
+BUSYBOX=/dev/shm/busybox
+
+# Reboot on exit with sysrq fallback — if busybox reboot fails for any
+# reason, sysrq-trigger forces an immediate hardware reboot.
+trap '"$BUSYBOX" reboot -f 2>/dev/null || { echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger; }' EXIT
 
 echo "flash-helper: decompressing and writing $IMAGE_PATH -> $TARGET_DEV"
 "$DECOMPRESS" "$IMAGE_PATH" | "$DD" of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
@@ -451,36 +463,54 @@ echo "flash-helper: dd complete:"
 
 # Apply first-boot customization if payload files were transferred.
 # Errors here must not abort — the image is already flashed successfully,
-# so we want to reboot regardless.
+# so we want to reboot regardless. Run in a subshell to isolate from set -e.
 if [ -f /dev/shm/custom-user-data ] || [ -f /dev/shm/custom-network-config ]; then
-  echo "flash-helper: applying first-boot customization..."
+  (
+    echo "flash-helper: applying first-boot customization..."
 
-  # Determine boot partition device name (mmcblk0p1 vs sda1).
-  # The kernel's old partition nodes are still valid — dd wrote a new
-  # partition table with the same layout, and the kernel keeps the stale
-  # entries until reboot. No blockdev --rereadpt needed (and it would
-  # fail anyway since the rootfs partition is still "in use").
-  BOOT_PART="${TARGET_DEV}p1"
-  "$BUSYBOX" test -b "$BOOT_PART" || BOOT_PART="${TARGET_DEV}1"
+    # Mount via loop device at the correct offset from the NEW partition table.
+    # After dd, the kernel still has stale partition nodes (old offsets/sizes)
+    # and stale block cache from the old image. Using the partition node would
+    # read/write at the wrong offset or serve cached data. Instead, parse the
+    # new partition table directly and create a loop device at the right offset.
+    #
+    # Busybox fdisk format (CHS columns precede LBA):
+    #   /dev/nvme0n1p1 *  128,0,1  1023,3,32  16384  1064959  1048576  512M c ...
+    # After stripping the optional boot flag (*), StartLBA is field 4.
+    PART1_LINE=$("$BUSYBOX" fdisk -l "$TARGET_DEV" 2>/dev/null \
+      | "$BUSYBOX" grep "^${TARGET_DEV}" | "$BUSYBOX" head -1)
+    PART1_START=$(echo "$PART1_LINE" | "$BUSYBOX" sed 's/\*//' | "$BUSYBOX" awk '{print $4}')
 
-  "$BUSYBOX" mkdir -p /dev/shm/bootmnt
-  if "$BUSYBOX" mount -t vfat "$BOOT_PART" /dev/shm/bootmnt; then
-    [ -f /dev/shm/custom-user-data ] && \
-      "$BUSYBOX" cp /dev/shm/custom-user-data /dev/shm/bootmnt/user-data
-    [ -f /dev/shm/custom-network-config ] && \
-      "$BUSYBOX" cp /dev/shm/custom-network-config /dev/shm/bootmnt/network-config
-    # Update regulatory domain in cmdline.txt to match WiFi country
-    if [ -f /dev/shm/custom-wifi-country ] && [ -f /dev/shm/bootmnt/cmdline.txt ]; then
-      REGDOM=$("$BUSYBOX" cat /dev/shm/custom-wifi-country | "$BUSYBOX" tr -d '[:space:]')
-      "$BUSYBOX" sed -i "s/cfg80211.ieee80211_regdom=[A-Z]*/cfg80211.ieee80211_regdom=$REGDOM/" /dev/shm/bootmnt/cmdline.txt
+    # Validate parsed offset — must be a positive integer
+    if ! echo "$PART1_START" | "$BUSYBOX" grep -qE '^[0-9]+$' || [ "$PART1_START" -eq 0 ]; then
+      echo "flash-helper: ERROR: failed to parse boot partition offset (got: '$PART1_START')"
+      exit 1
     fi
-    # umount flushes FAT32 data. No explicit sync — a global sync would risk
-    # writing back old rootfs dirty pages over the new image.
-    "$BUSYBOX" umount /dev/shm/bootmnt
-    echo "flash-helper: boot partition customization applied"
-  else
-    echo "flash-helper: ERROR: could not mount boot partition for customization"
-  fi
+    OFFSET=$((PART1_START * 512))
+
+    LOOP_DEV=$("$BUSYBOX" losetup -f)
+    "$BUSYBOX" losetup -o "$OFFSET" "$LOOP_DEV" "$TARGET_DEV"
+
+    "$BUSYBOX" mkdir -p /dev/shm/bootmnt
+    if "$BUSYBOX" mount -t vfat "$LOOP_DEV" /dev/shm/bootmnt; then
+      [ -f /dev/shm/custom-user-data ] && \
+        "$BUSYBOX" cp /dev/shm/custom-user-data /dev/shm/bootmnt/user-data
+      [ -f /dev/shm/custom-network-config ] && \
+        "$BUSYBOX" cp /dev/shm/custom-network-config /dev/shm/bootmnt/network-config
+      # Update regulatory domain in cmdline.txt to match WiFi country
+      if [ -f /dev/shm/custom-wifi-country ] && [ -f /dev/shm/bootmnt/cmdline.txt ]; then
+        REGDOM=$("$BUSYBOX" cat /dev/shm/custom-wifi-country | "$BUSYBOX" tr -d '[:space:]')
+        "$BUSYBOX" sed -i "s/cfg80211.ieee80211_regdom=[A-Z]*/cfg80211.ieee80211_regdom=$REGDOM/" /dev/shm/bootmnt/cmdline.txt
+      fi
+      # umount flushes FAT32 data. No explicit sync — a global sync would risk
+      # writing back old rootfs dirty pages over the new image.
+      "$BUSYBOX" umount /dev/shm/bootmnt
+      echo "flash-helper: boot partition customization applied"
+    else
+      echo "flash-helper: ERROR: could not mount boot partition for customization"
+    fi
+    "$BUSYBOX" losetup -d "$LOOP_DEV" 2>/dev/null || true
+  ) || echo "flash-helper: WARNING: customization failed, continuing to reboot"
 fi
 
 # EXIT trap handles reboot -f (skips sync so old rootfs cache doesn't
@@ -515,41 +545,61 @@ TARGET_DEV="$1"
 
 # Resolve all binary paths now — after dd overwrites the disk, PATH lookups
 # against the rootfs may fail (page cache eviction under memory pressure).
-BUSYBOX=$(command -v busybox)
+BUSYBOX_SRC=$(command -v busybox)
 DD=$(command -v dd)
 
-# Reboot when done (or on failure) — once dd starts, the rootfs is destroyed.
-trap '"$BUSYBOX" reboot -f' EXIT
+# Copy busybox to tmpfs (see ramfs helper for rationale).
+cp "$BUSYBOX_SRC" /dev/shm/busybox
+chmod +x /dev/shm/busybox
+BUSYBOX=/dev/shm/busybox
+
+# Reboot when done (or on failure) with sysrq fallback.
+trap '"$BUSYBOX" reboot -f 2>/dev/null || { echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger; }' EXIT
 
 echo "flash-helper: writing stdin -> $TARGET_DEV"
 "$DD" of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
 "$BUSYBOX" cat /dev/shm/dd-status 2>/dev/null || true
 echo "flash-helper: dd complete"
 
-# Apply first-boot customization if payload files were transferred
+# Apply first-boot customization if payload files were transferred.
+# Errors must not prevent reboot. Run in a subshell to isolate failures.
 if [ -f /dev/shm/custom-user-data ] || [ -f /dev/shm/custom-network-config ]; then
-  echo "flash-helper: applying first-boot customization..."
+  (
+    echo "flash-helper: applying first-boot customization..."
 
-  # See ramfs helper for explanation of why blockdev --rereadpt is skipped.
-  BOOT_PART="${TARGET_DEV}p1"
-  "$BUSYBOX" test -b "$BOOT_PART" || BOOT_PART="${TARGET_DEV}1"
+    # Mount via loop device at correct offset (see ramfs helper for rationale).
+    PART1_LINE=$("$BUSYBOX" fdisk -l "$TARGET_DEV" 2>/dev/null \
+      | "$BUSYBOX" grep "^${TARGET_DEV}" | "$BUSYBOX" head -1)
+    PART1_START=$(echo "$PART1_LINE" | "$BUSYBOX" sed 's/\*//' | "$BUSYBOX" awk '{print $4}')
 
-  "$BUSYBOX" mkdir -p /dev/shm/bootmnt
-  if "$BUSYBOX" mount -t vfat "$BOOT_PART" /dev/shm/bootmnt; then
-    [ -f /dev/shm/custom-user-data ] && \
-      "$BUSYBOX" cp /dev/shm/custom-user-data /dev/shm/bootmnt/user-data
-    [ -f /dev/shm/custom-network-config ] && \
-      "$BUSYBOX" cp /dev/shm/custom-network-config /dev/shm/bootmnt/network-config
-    # Update regulatory domain in cmdline.txt to match WiFi country
-    if [ -f /dev/shm/custom-wifi-country ] && [ -f /dev/shm/bootmnt/cmdline.txt ]; then
-      REGDOM=$("$BUSYBOX" cat /dev/shm/custom-wifi-country | "$BUSYBOX" tr -d '[:space:]')
-      "$BUSYBOX" sed -i "s/cfg80211.ieee80211_regdom=[A-Z]*/cfg80211.ieee80211_regdom=$REGDOM/" /dev/shm/bootmnt/cmdline.txt
+    # Validate parsed offset — must be a positive integer
+    if ! echo "$PART1_START" | "$BUSYBOX" grep -qE '^[0-9]+$' || [ "$PART1_START" -eq 0 ]; then
+      echo "flash-helper: ERROR: failed to parse boot partition offset (got: '$PART1_START')"
+      exit 1
     fi
-    "$BUSYBOX" umount /dev/shm/bootmnt
-    echo "flash-helper: boot partition customization applied"
-  else
-    echo "flash-helper: ERROR: could not mount boot partition for customization"
-  fi
+    OFFSET=$((PART1_START * 512))
+
+    LOOP_DEV=$("$BUSYBOX" losetup -f)
+    "$BUSYBOX" losetup -o "$OFFSET" "$LOOP_DEV" "$TARGET_DEV"
+
+    "$BUSYBOX" mkdir -p /dev/shm/bootmnt
+    if "$BUSYBOX" mount -t vfat "$LOOP_DEV" /dev/shm/bootmnt; then
+      [ -f /dev/shm/custom-user-data ] && \
+        "$BUSYBOX" cp /dev/shm/custom-user-data /dev/shm/bootmnt/user-data
+      [ -f /dev/shm/custom-network-config ] && \
+        "$BUSYBOX" cp /dev/shm/custom-network-config /dev/shm/bootmnt/network-config
+      # Update regulatory domain in cmdline.txt to match WiFi country
+      if [ -f /dev/shm/custom-wifi-country ] && [ -f /dev/shm/bootmnt/cmdline.txt ]; then
+        REGDOM=$("$BUSYBOX" cat /dev/shm/custom-wifi-country | "$BUSYBOX" tr -d '[:space:]')
+        "$BUSYBOX" sed -i "s/cfg80211.ieee80211_regdom=[A-Z]*/cfg80211.ieee80211_regdom=$REGDOM/" /dev/shm/bootmnt/cmdline.txt
+      fi
+      "$BUSYBOX" umount /dev/shm/bootmnt
+      echo "flash-helper: boot partition customization applied"
+    else
+      echo "flash-helper: ERROR: could not mount boot partition for customization"
+    fi
+    "$BUSYBOX" losetup -d "$LOOP_DEV" 2>/dev/null || true
+  ) || echo "flash-helper: WARNING: customization failed, continuing to reboot"
 fi
 
 echo "flash-helper: rebooting..."
