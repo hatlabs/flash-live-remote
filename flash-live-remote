@@ -46,6 +46,7 @@ parse_config() {
 # --- Argument parsing ---
 
 mode="ramfs"
+local_mode=false
 custom_hostname=""
 custom_user=""
 custom_password=""
@@ -58,6 +59,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --ramfs)  mode="ramfs";  shift ;;
     --stream) mode="stream"; shift ;;
+    --local)  local_mode=true; shift ;;
     --config)
       if [ $# -lt 2 ]; then
         echo "Error: --config requires a file path" >&2
@@ -67,22 +69,28 @@ while [[ $# -gt 0 ]]; do
     -*)
       echo "Error: unknown option '$1'" >&2
       echo "" >&2
-      echo "Usage: flash-live-remote [--ramfs|--stream] [--config FILE] <host> <image>" >&2
+      echo "Usage: flash-live-remote [--local] [--ramfs|--stream] [--config FILE] [<host>] <image>" >&2
       exit 1
       ;;
     *) break ;;
   esac
 done
 
-if [ $# -lt 2 ]; then
-  echo "Usage: flash-live-remote [--ramfs|--stream] [--config FILE] <host> <image>" >&2
+if [ "$local_mode" = true ]; then
+  required_args=1
+else
+  required_args=2
+fi
+
+if [ $# -lt "$required_args" ]; then
+  echo "Usage: flash-live-remote [--local] [--ramfs|--stream] [--config FILE] [<host>] <image>" >&2
   echo "" >&2
-  echo "Flash an image to a remote Linux device over the network." >&2
-  echo "The device must be running and accessible via SSH." >&2
+  echo "Flash an image to a Linux device, either remotely over SSH or locally." >&2
   echo "" >&2
   echo "Modes:" >&2
-  echo "  --ramfs            (default) scp image to /dev/shm, then decompress+dd locally" >&2
-  echo "  --stream           Stream image directly over SSH (for low-memory devices)" >&2
+  echo "  --ramfs            (default) Copy image to /dev/shm, then decompress+dd" >&2
+  echo "  --stream           Stream image directly (over SSH, or from another disk locally)" >&2
+  echo "  --local            Run on the device being flashed (no SSH, must be root)" >&2
   echo "" >&2
   echo "First-boot customization:" >&2
   echo "  --config FILE      Config file with key=value settings for first-boot customization." >&2
@@ -90,19 +98,29 @@ if [ $# -lt 2 ]; then
   echo "" >&2
   echo "Supported formats: .img, .img.xz, .img.gz" >&2
   echo "" >&2
-  echo "Examples:" >&2
+  echo "Examples (remote):" >&2
   echo "  flash-live-remote halos.local image.img.xz" >&2
   echo "  flash-live-remote --config myboat.conf halos.local image.img.xz" >&2
   echo "  flash-live-remote --stream pi@192.168.1.100 image.img" >&2
   echo "" >&2
+  echo "Examples (local):" >&2
+  echo "  sudo flash-live-remote --local image.img.xz" >&2
+  echo "  sudo flash-live-remote --local --stream --config myboat.conf /mnt/usb/image.img.xz" >&2
+  echo "" >&2
   echo "Prerequisites:" >&2
-  echo "  Local:  ssh, scp, xzcat/zcat (for compressed images)" >&2
+  echo "  Remote: ssh, scp, xzcat/zcat (for compressed images)" >&2
+  echo "  Local:  root access, xzcat/zcat (for compressed images)" >&2
   echo "  Target: busybox (with fdisk, losetup, mount, umount applets for customization)" >&2
   exit 1
 fi
 
-host="$1"
-image="$2"
+if [ "$local_mode" = true ]; then
+  host=""
+  image="$1"
+else
+  host="$1"
+  image="$2"
+fi
 
 # Validate image file exists
 if [ ! -f "$image" ]; then
@@ -122,7 +140,7 @@ case "$image" in
     ;;
 esac
 
-# Fixed remote filename avoids shell metacharacter issues with scp/ssh.
+# Fixed /dev/shm filename avoids shell metacharacter issues.
 # The extension is preserved so the helper knows how to decompress.
 case "$image" in
   *.img.xz) remote_image="/dev/shm/flash-image.img.xz" ;;
@@ -275,48 +293,83 @@ print(psk.hex())
       optional: true"
 fi
 
-# Mode-specific local prerequisites
-_require ssh scp
-if [ "$mode" = "stream" ]; then
+# Mode-specific prerequisites
+if [ "$local_mode" = true ]; then
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Error: --local mode must be run as root (use sudo)" >&2
+    exit 1
+  fi
   _require "$decompress_cmd"
+else
+  _require ssh scp
+  if [ "$mode" = "stream" ]; then
+    _require "$decompress_cmd"
+  fi
 fi
+
+# --- run_on_target: execute a command locally or via SSH ---
+
+run_on_target() {
+  if [ "$local_mode" = true ]; then
+    bash -c "$1"
+  else
+    ssh -n "$host" "$1"
+  fi
+}
+
+# Pipe stdin to a command on the target (for payload transfer)
+pipe_to_target() {
+  if [ "$local_mode" = true ]; then
+    bash -c "$1"
+  else
+    ssh "$host" "$1"
+  fi
+}
+
+target_label() {
+  if [ "$local_mode" = true ]; then
+    echo "local device"
+  else
+    echo "$host"
+  fi
+}
 
 # --- Phase 0: Resolve hostname and detect target device ---
 
-echo "=== Phase 0: Resolving hostname and checking target ==="
+echo "=== Phase 0: Detecting target device ==="
 
 # Verify busybox is available on target
-if ! ssh -n "$host" "command -v busybox" >/dev/null 2>&1; then
-  echo "Error: busybox not found on $host (required for flash helper)" >&2
+if ! run_on_target "command -v busybox" >/dev/null 2>&1; then
+  echo "Error: busybox not found on $(target_label) (required for flash helper)" >&2
   exit 1
 fi
 
 # Detect root block device
-root_part=$(ssh -n "$host" "findmnt -no SOURCE /")
+root_part=$(run_on_target "findmnt -no SOURCE /")
 if [ -z "$root_part" ]; then
   echo "Error: could not detect root partition" >&2
   exit 1
 fi
 
-root_dev=$(ssh -n "$host" "lsblk -ndo PKNAME '$root_part'")
+root_dev=$(run_on_target "lsblk -ndo PKNAME '$root_part'")
 if [ -z "$root_dev" ]; then
   echo "Error: could not determine parent device for $root_part" >&2
   exit 1
 fi
 root_dev="/dev/$root_dev"
 
-if ! ssh -n "$host" "test -b '$root_dev'"; then
-  echo "Error: $root_dev is not a valid block device on $host" >&2
+if ! run_on_target "test -b '$root_dev'"; then
+  echo "Error: $root_dev is not a valid block device on $(target_label)" >&2
   exit 1
 fi
 
-dev_size=$(ssh -n "$host" "lsblk -bno SIZE '$root_dev' | head -1")
+dev_size=$(run_on_target "lsblk -bno SIZE '$root_dev' | head -1")
 dev_size_gb=$((dev_size / 1073741824))
 
 # Mode-specific preflight checks
 if [ "$mode" = "ramfs" ]; then
   # Check /dev/shm capacity (trim whitespace from df output)
-  shm_avail=$(ssh -n "$host" "df -B1 --output=avail /dev/shm | tail -1 | tr -d ' '")
+  shm_avail=$(run_on_target "df -B1 --output=avail /dev/shm | tail -1 | tr -d ' '")
   shm_avail_mb=$((shm_avail / 1048576))
   margin_bytes=209715200  # 200 MB
   required=$((image_size + margin_bytes))
@@ -332,8 +385,8 @@ if [ "$mode" = "ramfs" ]; then
 
   # Check decompression tool on target
   if [ "$decompress_cmd" != "cat" ]; then
-    if ! ssh -n "$host" "command -v $decompress_cmd" >/dev/null 2>&1; then
-      echo "Error: $decompress_cmd not found on $host (required for decompression)" >&2
+    if ! run_on_target "command -v $decompress_cmd" >/dev/null 2>&1; then
+      echo "Error: $decompress_cmd not found on $(target_label) (required for decompression)" >&2
       exit 1
     fi
   fi
@@ -344,15 +397,15 @@ if [ "$has_customization" = true ]; then
   echo "Checking customization prerequisites on target..."
 
   # Verify kernel supports vfat
-  if ! ssh -n "$host" "grep -q vfat /proc/filesystems"; then
-    echo "Error: kernel on $host lacks vfat support (required for customization)" >&2
+  if ! run_on_target "grep -q vfat /proc/filesystems"; then
+    echo "Error: kernel on $(target_label) lacks vfat support (required for customization)" >&2
     exit 1
   fi
 
   # Verify busybox has required applets for loop-mount boot partition
   for applet in fdisk losetup; do
-    if ! ssh -n "$host" "busybox $applet --help" >/dev/null 2>&1; then
-      echo "Error: busybox on $host lacks $applet applet (required for customization)" >&2
+    if ! run_on_target "busybox $applet --help" >/dev/null 2>&1; then
+      echo "Error: busybox on $(target_label) lacks $applet applet (required for customization)" >&2
       exit 1
     fi
   done
@@ -361,11 +414,17 @@ fi
 # --- Confirmation prompt ---
 
 echo ""
-echo "  Mode: $mode"
+if [ "$local_mode" = true ]; then
+  echo "  Mode: local $mode"
+else
+  echo "  Mode: $mode"
+fi
 echo "  Target device: $root_dev (~${dev_size_gb} GB)"
 echo "  Root partition: $root_part"
 echo "  Image file: $image (${image_size_mb} MB ${size_label})"
-echo "  Target host: $host"
+if [ "$local_mode" != true ]; then
+  echo "  Target host: $host"
+fi
 if [ "$has_customization" = true ]; then
   echo ""
   echo "  First-boot customization:"
@@ -379,8 +438,13 @@ if [ "$has_customization" = true ]; then
   [ -n "$wifi_ssid" ] && echo "    WiFi: $wifi_ssid (country: $wifi_country)"
 fi
 echo ""
-echo "WARNING: This will ERASE ALL DATA on $root_dev on $host."
-echo "The device will be unreachable during flashing and will reboot when done."
+if [ "$local_mode" = true ]; then
+  echo "WARNING: This will ERASE ALL DATA on $root_dev."
+  echo "The device will reboot when flashing is done."
+else
+  echo "WARNING: This will ERASE ALL DATA on $root_dev on $host."
+  echo "The device will be unreachable during flashing and will reboot when done."
+fi
 echo ""
 read -r -p "Type 'yes' to proceed: " confirm
 if [ "$confirm" != "yes" ]; then
@@ -394,12 +458,12 @@ if [ "$has_customization" = true ]; then
   echo ""
   echo "Transferring customization payloads..."
   if [ -n "$custom_user_data" ]; then
-    echo "$custom_user_data" | ssh "$host" "cat > /dev/shm/custom-user-data"
-    echo "$custom_meta_data" | ssh "$host" "cat > /dev/shm/custom-meta-data"
+    echo "$custom_user_data" | pipe_to_target "cat > /dev/shm/custom-user-data"
+    echo "$custom_meta_data" | pipe_to_target "cat > /dev/shm/custom-meta-data"
   fi
   if [ -n "$custom_network_config" ]; then
-    echo "$custom_network_config" | ssh "$host" "cat > /dev/shm/custom-network-config"
-    echo "$wifi_country" | ssh "$host" "cat > /dev/shm/custom-wifi-country"
+    echo "$custom_network_config" | pipe_to_target "cat > /dev/shm/custom-network-config"
+    echo "$wifi_country" | pipe_to_target "cat > /dev/shm/custom-wifi-country"
   fi
 fi
 
@@ -649,9 +713,230 @@ HELPER_EOF
   echo "Wait ~60s then try: ssh $host"
 }
 
+# --- Local ramfs mode ---
+
+flash_local_ramfs() {
+  echo ""
+  echo "=== Phase 1: Copying image to /dev/shm ==="
+
+  echo "Copying $image to $remote_image..."
+  cp "$image" "$remote_image"
+
+  # Verify file size matches
+  local_copy_size=$(stat -c%s "$remote_image")
+  if [ "$local_copy_size" != "$image_size" ]; then
+    echo "Error: size mismatch after copy" >&2
+    echo "  Original: $image_size bytes" >&2
+    echo "  Copy:     $local_copy_size bytes" >&2
+    echo "Cleaning up..."
+    rm -f "$remote_image"
+    exit 1
+  fi
+  echo "Copy verified: $local_copy_size bytes"
+
+  echo ""
+  echo "=== Phase 2: Flashing image ==="
+
+  echo "Stopping services..."
+  systemctl stop 'container-*' 'marine-*' 'halos-*' cockpit docker 2>/dev/null || true
+  sync
+
+  # Deploy helper script (same as remote ramfs — already runs on target)
+  cat > /dev/shm/flash-helper.sh <<'HELPER_EOF'
+#!/bin/bash
+set -eo pipefail
+
+IMAGE_PATH="$1"
+TARGET_DEV="$2"
+DECOMPRESS_CMD="$3"
+
+BUSYBOX_SRC=$(command -v busybox)
+DD=$(command -v dd)
+DECOMPRESS=$(command -v "$DECOMPRESS_CMD")
+
+cp "$BUSYBOX_SRC" /dev/shm/busybox
+chmod +x /dev/shm/busybox
+BUSYBOX=/dev/shm/busybox
+
+trap '"$BUSYBOX" reboot -f 2>/dev/null || { echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger; }' EXIT
+
+echo "flash-helper: decompressing and writing $IMAGE_PATH -> $TARGET_DEV"
+"$DECOMPRESS" "$IMAGE_PATH" | "$DD" of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
+echo "flash-helper: dd complete:"
+"$BUSYBOX" cat /dev/shm/dd-status 2>/dev/null || true
+
+"$BUSYBOX" rm -f "$IMAGE_PATH"
+
+if [ -f /dev/shm/custom-user-data ] || [ -f /dev/shm/custom-network-config ]; then
+  (
+    echo "flash-helper: applying first-boot customization..."
+
+    PART1_LINE=$("$BUSYBOX" fdisk -l "$TARGET_DEV" 2>/dev/null \
+      | "$BUSYBOX" grep "^${TARGET_DEV}" | "$BUSYBOX" head -1)
+    PART1_START=$(echo "$PART1_LINE" | "$BUSYBOX" sed 's/\*//' | "$BUSYBOX" awk '{print $4}')
+
+    if ! echo "$PART1_START" | "$BUSYBOX" grep -qE '^[0-9]+$' || [ "$PART1_START" -eq 0 ]; then
+      echo "flash-helper: ERROR: failed to parse boot partition offset (got: '$PART1_START')"
+      exit 1
+    fi
+    OFFSET=$((PART1_START * 512))
+
+    LOOP_DEV=$("$BUSYBOX" losetup -f)
+    "$BUSYBOX" losetup -o "$OFFSET" "$LOOP_DEV" "$TARGET_DEV"
+
+    "$BUSYBOX" mkdir -p /dev/shm/bootmnt
+    if "$BUSYBOX" mount -t vfat "$LOOP_DEV" /dev/shm/bootmnt; then
+      [ -f /dev/shm/custom-user-data ] && \
+        "$BUSYBOX" cp /dev/shm/custom-user-data /dev/shm/bootmnt/user-data
+      [ -f /dev/shm/custom-meta-data ] && \
+        "$BUSYBOX" cp /dev/shm/custom-meta-data /dev/shm/bootmnt/meta-data
+      [ -f /dev/shm/custom-network-config ] && \
+        "$BUSYBOX" cp /dev/shm/custom-network-config /dev/shm/bootmnt/network-config
+      if [ -f /dev/shm/custom-wifi-country ] && [ -f /dev/shm/bootmnt/cmdline.txt ]; then
+        REGDOM=$("$BUSYBOX" cat /dev/shm/custom-wifi-country | "$BUSYBOX" tr -d '[:space:]')
+        "$BUSYBOX" sed -i "s/cfg80211.ieee80211_regdom=[A-Z]*/cfg80211.ieee80211_regdom=$REGDOM/" /dev/shm/bootmnt/cmdline.txt
+      fi
+      "$BUSYBOX" umount /dev/shm/bootmnt
+      echo "flash-helper: boot partition customization applied"
+    else
+      echo "flash-helper: ERROR: could not mount boot partition for customization"
+    fi
+    "$BUSYBOX" losetup -d "$LOOP_DEV" 2>/dev/null || true
+  ) || echo "flash-helper: WARNING: customization failed, continuing to reboot"
+fi
+
+echo "flash-helper: rebooting..."
+HELPER_EOF
+
+  chmod +x /dev/shm/flash-helper.sh
+
+  echo "Launching flash helper..."
+  setsid /dev/shm/flash-helper.sh "$remote_image" "$root_dev" "$decompress_cmd" </dev/null >/dev/shm/flash-helper.log 2>&1 &
+
+  echo ""
+  echo "Image is being flashed. The device will reboot automatically when done."
+}
+
+# --- Local stream mode ---
+
+flash_local_stream() {
+  echo ""
+  echo "=== Phase 1: Safety checks ==="
+
+  # Refuse to stream if the image resides on the same block device being flashed.
+  # Streaming reads the image while dd overwrites the disk — if they're the same
+  # device, the read will get corrupted data.
+  image_mount=$(findmnt -no SOURCE --target "$image")
+  if [ -n "$image_mount" ]; then
+    image_parent=$(lsblk -ndo PKNAME "$image_mount" 2>/dev/null || true)
+    if [ -n "$image_parent" ] && [ "/dev/$image_parent" = "$root_dev" ]; then
+      echo "Error: image file resides on the same block device being flashed ($root_dev)" >&2
+      echo "  Image mount: $image_mount (parent: /dev/$image_parent)" >&2
+      echo "  Use --ramfs mode to safely flash from the same disk." >&2
+      exit 1
+    fi
+  fi
+  echo "Image is on a different block device — safe to stream."
+
+  echo "Stopping services..."
+  systemctl stop 'container-*' 'marine-*' 'halos-*' cockpit docker 2>/dev/null || true
+  sync
+
+  echo ""
+  echo "=== Phase 2: Streaming image ==="
+
+  start_time=$(date +%s)
+
+  echo "Decompressing and writing to $root_dev..."
+  # No helper script needed — dd runs directly in the pipe. Unlike the remote
+  # stream mode, we cannot use an EXIT-trap-based helper because it runs in our
+  # own process and a reboot trap would kill us before we can check PIPESTATUS.
+  set +eo pipefail
+  "$decompress_cmd" "$image" | dd of="$root_dev" bs=4M 2>/dev/shm/dd-status
+  decompress_exit=${PIPESTATUS[0]}
+  dd_exit=${PIPESTATUS[1]}
+  set -eo pipefail
+
+  end_time=$(date +%s)
+  elapsed_s=$((end_time - start_time))
+
+  # After dd, the rootfs is overwritten. Copy busybox to tmpfs immediately
+  # so post-dd operations don't depend on rootfs page cache.
+  BUSYBOX_SRC=$(command -v busybox)
+  cp "$BUSYBOX_SRC" /dev/shm/busybox
+  chmod +x /dev/shm/busybox
+  BUSYBOX=/dev/shm/busybox
+
+  "$BUSYBOX" cat /dev/shm/dd-status 2>/dev/null || true
+
+  if [ "$decompress_exit" -ne 0 ]; then
+    echo "Error: decompression failed (exit code $decompress_exit)." >&2
+    echo "The device may be in an inconsistent state." >&2
+    # Still reboot — the disk is already overwritten
+    "$BUSYBOX" reboot -f 2>/dev/null || { echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger; }
+  fi
+  if [ "$dd_exit" -ne 0 ]; then
+    echo "Error: dd failed (exit code $dd_exit)." >&2
+    echo "The device may be in an inconsistent state." >&2
+    "$BUSYBOX" reboot -f 2>/dev/null || { echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger; }
+  fi
+
+  echo "dd complete (${elapsed_s}s)."
+
+  # Apply first-boot customization
+  if [ -f /dev/shm/custom-user-data ] || [ -f /dev/shm/custom-network-config ]; then
+    echo "Applying first-boot customization..."
+
+    (
+      PART1_LINE=$("$BUSYBOX" fdisk -l "$root_dev" 2>/dev/null \
+        | "$BUSYBOX" grep "^${root_dev}" | "$BUSYBOX" head -1)
+      PART1_START=$(echo "$PART1_LINE" | "$BUSYBOX" sed 's/\*//' | "$BUSYBOX" awk '{print $4}')
+
+      if ! echo "$PART1_START" | "$BUSYBOX" grep -qE '^[0-9]+$' || [ "$PART1_START" -eq 0 ]; then
+        echo "ERROR: failed to parse boot partition offset (got: '$PART1_START')"
+        exit 1
+      fi
+      OFFSET=$((PART1_START * 512))
+
+      LOOP_DEV=$("$BUSYBOX" losetup -f)
+      "$BUSYBOX" losetup -o "$OFFSET" "$LOOP_DEV" "$root_dev"
+
+      "$BUSYBOX" mkdir -p /dev/shm/bootmnt
+      if "$BUSYBOX" mount -t vfat "$LOOP_DEV" /dev/shm/bootmnt; then
+        [ -f /dev/shm/custom-user-data ] && \
+          "$BUSYBOX" cp /dev/shm/custom-user-data /dev/shm/bootmnt/user-data
+        [ -f /dev/shm/custom-meta-data ] && \
+          "$BUSYBOX" cp /dev/shm/custom-meta-data /dev/shm/bootmnt/meta-data
+        [ -f /dev/shm/custom-network-config ] && \
+          "$BUSYBOX" cp /dev/shm/custom-network-config /dev/shm/bootmnt/network-config
+        if [ -f /dev/shm/custom-wifi-country ] && [ -f /dev/shm/bootmnt/cmdline.txt ]; then
+          REGDOM=$("$BUSYBOX" cat /dev/shm/custom-wifi-country | "$BUSYBOX" tr -d '[:space:]')
+          "$BUSYBOX" sed -i "s/cfg80211.ieee80211_regdom=[A-Z]*/cfg80211.ieee80211_regdom=$REGDOM/" /dev/shm/bootmnt/cmdline.txt
+        fi
+        "$BUSYBOX" umount /dev/shm/bootmnt
+        echo "Boot partition customization applied."
+      else
+        echo "ERROR: could not mount boot partition for customization"
+      fi
+      "$BUSYBOX" losetup -d "$LOOP_DEV" 2>/dev/null || true
+    ) || echo "WARNING: customization failed, continuing to reboot"
+  fi
+
+  echo "Rebooting..."
+  # reboot -f skips sync so old rootfs cache doesn't write back over the new image
+  "$BUSYBOX" reboot -f 2>/dev/null || { echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger; }
+}
+
 # --- Dispatch ---
 
-case "$mode" in
-  ramfs)  flash_ramfs ;;
-  stream) flash_stream ;;
-esac
+if [ "$local_mode" = true ]; then
+  case "$mode" in
+    ramfs)  flash_local_ramfs ;;
+    stream) flash_local_stream ;;
+  esac
+else
+  case "$mode" in
+    ramfs)  flash_ramfs ;;
+    stream) flash_stream ;;
+  esac
+fi
