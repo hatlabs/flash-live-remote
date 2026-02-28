@@ -750,10 +750,9 @@ flash_local_ramfs() {
   deploy_ramfs_helper
 
   echo "Launching flash helper..."
-  setsid /dev/shm/flash-helper.sh "$remote_image" "$root_dev" "$decompress_cmd" </dev/null >/dev/shm/flash-helper.log 2>&1 &
-
-  echo ""
-  echo "Image is being flashed. The device will reboot automatically when done."
+  # Run in foreground — no SSH session to survive, and the user needs to see
+  # that flashing is still in progress. The EXIT trap in the helper reboots.
+  exec /dev/shm/flash-helper.sh "$remote_image" "$root_dev" "$decompress_cmd"
 }
 
 # --- Local stream mode ---
@@ -793,11 +792,6 @@ flash_local_stream() {
     DECOMPRESS_SRC=$(command -v "$decompress_cmd")
     cp "$DECOMPRESS_SRC" /dev/shm/decompress
     chmod +x /dev/shm/decompress
-  else
-    cp "$BUSYBOX_SRC" /dev/shm/decompress
-    chmod +x /dev/shm/decompress
-    # busybox cat will be used as the decompressor
-    decompress_cmd="cat"
   fi
 
   # Write helper script to tmpfs. This will be exec'd under busybox sh

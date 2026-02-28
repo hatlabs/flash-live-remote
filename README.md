@@ -88,7 +88,7 @@ Tilde (`~/`) in `ssh-key` paths is expanded automatically. The `ssh-key` key can
 
 After `dd` completes, the helper mounts the boot partition (FAT32, partition 1) and writes `user-data` and/or `network-config` files for cloud-init. If no config file is given, behavior is identical to a plain flash.
 
-**Important:** Customization assumes the new image has the same partition layout as the currently running image (boot partition = partition 1). After `dd`, the kernel cannot re-read the partition table because the old rootfs is still "in use", so the helper mounts using the pre-existing partition device node. If the new image has a different partition layout, do not use `--config` — flash without customization and configure manually after first boot.
+**Important:** Customization assumes the new image has a FAT32 boot partition as partition 1. After `dd`, the helper parses the new partition table via `busybox fdisk` and loop-mounts at the correct offset, so the new image's partition layout does not need to match the old one. However, if the new image lacks a FAT32 boot partition, customization will fail (the flash itself still succeeds and the device reboots normally).
 
 ### Ramfs mode (default)
 
