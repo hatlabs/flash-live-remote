@@ -249,18 +249,29 @@ if [ ${#ud_lines[@]} -gt 1 ]; then
 fi
 
 if [ -n "$wifi_ssid" ]; then
-  # cloud-init treats network-config as the complete network definition,
-  # so we must include eth0 — otherwise wired ethernet loses DHCP.
+  # Compute WPA PSK from passphrase + SSID (avoids plaintext password on disk)
+  _require python3
+  wifi_psk=$(python3 -c "
+import hashlib, sys
+psk = hashlib.pbkdf2_hmac('sha1', sys.argv[1].encode(), sys.argv[2].encode(), 4096, 32)
+print(psk.hex())
+" "$wifi_password" "$wifi_ssid")
+
+  # Match RPi Imager's network-config format exactly
   custom_network_config="network:
   version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+      dhcp6: true
+      optional: true
   wifis:
-    renderer: NetworkManager
     wlan0:
       dhcp4: true
       regulatory-domain: \"$wifi_country\"
       access-points:
         \"$wifi_ssid\":
-          password: \"$wifi_password\"
+          password: \"$wifi_psk\"
       optional: true"
 fi
 
@@ -379,6 +390,7 @@ if [ "$has_customization" = true ]; then
   fi
   if [ -n "$custom_network_config" ]; then
     echo "$custom_network_config" | ssh "$host" "cat > /dev/shm/custom-network-config"
+    echo "$wifi_country" | ssh "$host" "cat > /dev/shm/custom-wifi-country"
   fi
 fi
 
@@ -457,6 +469,11 @@ if [ -f /dev/shm/custom-user-data ] || [ -f /dev/shm/custom-network-config ]; th
       "$BUSYBOX" cp /dev/shm/custom-user-data /dev/shm/bootmnt/user-data
     [ -f /dev/shm/custom-network-config ] && \
       "$BUSYBOX" cp /dev/shm/custom-network-config /dev/shm/bootmnt/network-config
+    # Update regulatory domain in cmdline.txt to match WiFi country
+    if [ -f /dev/shm/custom-wifi-country ] && [ -f /dev/shm/bootmnt/cmdline.txt ]; then
+      REGDOM=$("$BUSYBOX" cat /dev/shm/custom-wifi-country | "$BUSYBOX" tr -d '[:space:]')
+      "$BUSYBOX" sed -i "s/cfg80211.ieee80211_regdom=[A-Z]*/cfg80211.ieee80211_regdom=$REGDOM/" /dev/shm/bootmnt/cmdline.txt
+    fi
     # umount flushes FAT32 data. No explicit sync — a global sync would risk
     # writing back old rootfs dirty pages over the new image.
     "$BUSYBOX" umount /dev/shm/bootmnt
@@ -523,6 +540,11 @@ if [ -f /dev/shm/custom-user-data ] || [ -f /dev/shm/custom-network-config ]; th
       "$BUSYBOX" cp /dev/shm/custom-user-data /dev/shm/bootmnt/user-data
     [ -f /dev/shm/custom-network-config ] && \
       "$BUSYBOX" cp /dev/shm/custom-network-config /dev/shm/bootmnt/network-config
+    # Update regulatory domain in cmdline.txt to match WiFi country
+    if [ -f /dev/shm/custom-wifi-country ] && [ -f /dev/shm/bootmnt/cmdline.txt ]; then
+      REGDOM=$("$BUSYBOX" cat /dev/shm/custom-wifi-country | "$BUSYBOX" tr -d '[:space:]')
+      "$BUSYBOX" sed -i "s/cfg80211.ieee80211_regdom=[A-Z]*/cfg80211.ieee80211_regdom=$REGDOM/" /dev/shm/bootmnt/cmdline.txt
+    fi
     "$BUSYBOX" umount /dev/shm/bootmnt
     echo "flash-helper: boot partition customization applied"
   else
