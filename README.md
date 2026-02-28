@@ -8,9 +8,10 @@ Flash a Linux SBC over the network while it's running. Transfers a disk image fr
 - `ssh`, `scp`
 - `xzcat` / `zcat` (for compressed images)
 - `openssl` (only if using `password` in config)
+- `python3` (only if using `wifi-ssid` in config)
 
 **Target device:**
-- `busybox` (with `blockdev`, `mount`, `umount` applets if using customization)
+- `busybox` (with `fdisk`, `losetup`, `mount`, `umount` applets if using customization)
 - SSH access
 - Linux with `systemd`, `findmnt`, `lsblk`, `dd`
 - Ramfs mode: enough RAM in `/dev/shm` to hold the compressed image (~4 GB+ devices)
@@ -109,15 +110,16 @@ Dev machine                               Target (Linux SBC)
 Phase 0: SSH ──────────────────────────── Detect root block device
          SSH ──────────────────────────── Check /dev/shm capacity, xzcat/zcat
          SSH ──────────────────────────── Check customization prerequisites*
-         SSH ──────────────────────────── Transfer cloud-init payloads*
          Confirm with user
+         SSH ──────────────────────────── Transfer cloud-init payloads*
 Phase 1: scp image.img.xz ─────────────── /dev/shm/image.img.xz
          SSH ──────────────────────────── Verify file size matches
 Phase 2: SSH ──────────────────────────── Stop services, sync
-         SSH ──────────────────────────── Deploy helper to /dev/shm
+         SSH ──────────────────────────── Deploy helper (copies busybox to tmpfs)
          SSH ──────────────────────────── Launch helper (detached)
                                           Helper: xzcat /dev/shm/image | dd
-                                          Helper: mount boot, write cloud-init*
+                                          Helper: loop-mount boot partition*
+                                          Helper: write cloud-init files*
                                           Helper: reboot -f
 ```
 *Only when --config is provided.
@@ -129,12 +131,13 @@ Dev machine                               Target (Linux SBC)
 ───────────                               ──────────────────
 Phase 0: SSH ──────────────────────────── Detect root block device
          SSH ──────────────────────────── Check customization prerequisites*
-         SSH ──────────────────────────── Transfer cloud-init payloads*
          Confirm with user
-Phase 1: SSH ──────────────────────────── Deploy helper to /dev/shm
+         SSH ──────────────────────────── Transfer cloud-init payloads*
+Phase 1: SSH ──────────────────────────── Deploy helper (copies busybox to tmpfs)
          SSH ──────────────────────────── Stop services, sync
-Phase 2: xzcat | ssh "dd of=/dev/..." ──── dd writes to block device
-                                          Helper: mount boot, write cloud-init*
+Phase 2: xzcat | ssh "helper" ─────────── dd writes to block device
+                                          Helper: loop-mount boot partition*
+                                          Helper: write cloud-init files*
                                           Helper: reboot -f (via EXIT trap)
 ```
 *Only when --config is provided.
