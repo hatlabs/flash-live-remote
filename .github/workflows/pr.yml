@@ -1,0 +1,83 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        run: ./run build
+
+      - name: Verify output
+        run: |
+          test -f dist/flash-live-system
+          grep -q "BUSYBOX_EOF" dist/flash-live-system
+
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shellcheck source script
+        run: shellcheck flash-live-system
+
+      - name: Shellcheck run script
+        run: shellcheck run
+
+  version-bump-check:
+    name: Version bump check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check VERSION changed
+        run: |
+          BASE_SHA=$(git merge-base origin/main HEAD)
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA"...HEAD)
+
+          # Filter to package-affecting files using the same exclusion
+          # patterns as shared-workflows/pr-checks.yml
+          PACKAGE_FILES=$(echo "$CHANGED_FILES" \
+            | grep -v -E '^(VERSION$|.*\.md$|docs/|\.github/|\.devcontainer/|\.vscode/|\.claude/)' \
+            | grep -v -E '^(lefthook\.yml$|\.bumpversion\.cfg$|\.gitignore$|\.editorconfig$|LICENSE)' \
+            | grep -v -E '^(tests?/|__tests__/|e2e/|.*\.test\.[^/]+$|.*\.spec\.[^/]+$)' \
+            | grep -v -E '^(docker/|Dockerfile|docker-compose|config\.)' \
+            | grep -v -E '^(tools/|run$|Makefile$|Taskfile\.yml$)' \
+            | grep -v -E '\.(lock)$' \
+            | grep -v -E '\.lintian-overrides$' \
+            || true)
+
+          if [ -n "$PACKAGE_FILES" ]; then
+            if ! echo "$CHANGED_FILES" | grep -q '^VERSION$'; then
+              echo "::error::Package-affecting files changed but VERSION was not bumped."
+              echo ""
+              echo "Changed package files:"
+              echo "$PACKAGE_FILES" | sed 's/^/  /'
+              echo ""
+              echo "Update VERSION (e.g., echo '0.2.0' > VERSION)"
+              exit 1
+            fi
+            echo "VERSION file updated — OK"
+          else
+            echo "Only non-package files changed, no version bump needed"
+          fi

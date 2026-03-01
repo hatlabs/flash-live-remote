@@ -1,0 +1,133 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.repository }}-main-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        run: echo "version=$(cat VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate revision
+        id: revision
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # Count existing tags matching v{VERSION}+*
+          COUNT=$(git tag -l "v${VERSION}+*" | wc -l | tr -d ' ')
+          echo "revision=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION, Revision: $COUNT"
+
+      - name: Check if pre-release already exists
+        id: check-prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REVISION: ${{ steps.revision.outputs.revision }}
+        run: |
+          TAG="v${VERSION}+${REVISION}_pre"
+          if gh release view "$TAG" &>/dev/null; then
+            echo "action=skip" >> "$GITHUB_OUTPUT"
+            echo "Pre-release $TAG already exists, skipping"
+          else
+            echo "action=create" >> "$GITHUB_OUTPUT"
+            echo "Pre-release $TAG does not exist, will create"
+          fi
+
+      - name: Set up QEMU
+        if: steps.check-prerelease.outputs.action == 'create'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        if: steps.check-prerelease.outputs.action == 'create'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        if: steps.check-prerelease.outputs.action == 'create'
+        run: ./run build
+
+      - name: Verify output
+        if: steps.check-prerelease.outputs.action == 'create'
+        run: |
+          test -f dist/flash-live-system
+          grep -q "BUSYBOX_EOF" dist/flash-live-system
+
+      - name: Create pre-release tag
+        if: steps.check-prerelease.outputs.action == 'create'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REVISION: ${{ steps.revision.outputs.revision }}
+        run: |
+          TAG="v${VERSION}+${REVISION}_pre"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Create pre-release
+        if: steps.check-prerelease.outputs.action == 'create'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REVISION: ${{ steps.revision.outputs.revision }}
+        run: |
+          TAG="v${VERSION}+${REVISION}_pre"
+          gh release create "$TAG" dist/flash-live-system \
+            --title "$TAG" \
+            --prerelease \
+            --notes "Pre-release build from $(git rev-parse --short HEAD)"
+
+      - name: Delete old draft releases
+        if: steps.check-prerelease.outputs.action == 'create'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release list --json tagName,isDraft --jq '.[] | select(.isDraft) | .tagName' | while read -r tag; do
+            echo "Deleting old draft release: $tag"
+            gh release delete "$tag" --yes 2>/dev/null || true
+          done
+
+      - name: Create draft stable release
+        if: steps.check-prerelease.outputs.action == 'create'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REVISION: ${{ steps.revision.outputs.revision }}
+        run: |
+          TAG="v${VERSION}+${REVISION}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          NOTES="$(cat <<NOTES
+## flash-live-system $TAG
+
+Built from $(git rev-parse --short HEAD).
+
+### Installation
+
+\`\`\`bash
+curl -Lo /usr/local/bin/flash-live-system \\
+  https://github.com/${{ github.repository }}/releases/download/${TAG}/flash-live-system
+chmod +x /usr/local/bin/flash-live-system
+\`\`\`
+NOTES
+          )"
+          gh release create "$TAG" dist/flash-live-system \
+            --title "$TAG" \
+            --draft \
+            --notes "$NOTES"
