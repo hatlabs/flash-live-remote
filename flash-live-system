@@ -67,6 +67,9 @@ custom_ssh_keys=()
 wifi_ssid=""
 wifi_password=""
 wifi_country="GB"
+skip_confirm=false
+skip_confirm_yes=false
+skip_confirm_really=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -84,18 +87,31 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       parse_config "$2"; shift 2 ;;
+    --yes) skip_confirm_yes=true; shift ;;
+    --yes-i-really-mean-it) skip_confirm_really=true; shift ;;
     -*)
       echo "Error: unknown option '$1'" >&2
       echo "" >&2
-      echo "Usage: flash-live-system [--remote <host>] [--ramfs|--stream] [--config FILE] <image>" >&2
+      echo "Usage: flash-live-system [--remote <host>] [--ramfs|--stream] [--config FILE] [--yes --yes-i-really-mean-it] <image>" >&2
       exit 1
       ;;
     *) break ;;
   esac
 done
 
+# Validate --yes / --yes-i-really-mean-it flags
+if $skip_confirm_yes && $skip_confirm_really; then
+  skip_confirm=true
+elif $skip_confirm_yes; then
+  echo "Error: --yes alone is not enough. You must also pass --yes-i-really-mean-it to skip confirmation." >&2
+  exit 1
+elif $skip_confirm_really; then
+  echo "Error: --yes-i-really-mean-it requires --yes as well." >&2
+  exit 1
+fi
+
 if [ $# -lt 1 ]; then
-  echo "Usage: flash-live-system [--remote <host>] [--ramfs|--stream] [--config FILE] <image>" >&2
+  echo "Usage: flash-live-system [--remote <host>] [--ramfs|--stream] [--config FILE] [--yes --yes-i-really-mean-it] <image>" >&2
   echo "" >&2
   echo "Flash an image to a Linux device, either locally or remotely over SSH." >&2
   echo "" >&2
@@ -105,6 +121,8 @@ if [ $# -lt 1 ]; then
   echo "  --stream           Stream image directly (over SSH, or from another disk locally)" >&2
   echo "  --config FILE      Config file with key=value settings for first-boot customization." >&2
   echo "                     See example.conf for available keys and format." >&2
+  echo "  --yes --yes-i-really-mean-it" >&2
+  echo "                     Skip the interactive confirmation prompt (both flags required)." >&2
   echo "" >&2
   echo "In local mode (default), auto-detects ramfs vs stream based on /dev/shm space" >&2
   echo "and disk layout. Must be run as root." >&2
@@ -467,10 +485,20 @@ else
   echo "The device will be unreachable during flashing and will reboot when done."
 fi
 echo ""
-read -r -p "Type 'yes' to proceed: " confirm
-if [ "$confirm" != "yes" ]; then
-  echo "Aborted."
-  exit 1
+if $skip_confirm; then
+  echo "Skipping confirmation (--yes --yes-i-really-mean-it)."
+else
+  if [ -z "$remote_host" ]; then
+    nuke_target="localhost"
+  else
+    nuke_target="$remote_host"
+  fi
+  confirm_phrase="nuke $nuke_target from orbit"
+  read -r -p "Type \"$confirm_phrase\" to proceed: " confirm
+  if [ "$confirm" != "$confirm_phrase" ]; then
+    echo "Aborted."
+    exit 1
+  fi
 fi
 
 # Deploy embedded busybox to target
