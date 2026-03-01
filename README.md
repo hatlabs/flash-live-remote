@@ -1,8 +1,14 @@
-# flash-live-remote
+# flash-live-system
 
-Flash a Linux SBC — either over the network or locally on the device itself. Transfers a disk image, overwrites the boot device, and reboots into the new image.
+Flash a Linux SBC — locally on the device itself or over the network. Transfers a disk image, overwrites the boot device, and reboots into the new image.
 
 ## Prerequisites
+
+**Local mode (default — on the device itself):**
+- Root access (run with `sudo`)
+- `busybox`, `findmnt`, `lsblk`, `dd`, `xzcat` / `zcat`
+- Ramfs mode: enough RAM in `/dev/shm` to hold the compressed image
+- Stream mode: image must be on a different block device than the one being flashed
 
 **Remote mode (dev machine):**
 - `ssh`, `scp`
@@ -17,33 +23,27 @@ Flash a Linux SBC — either over the network or locally on the device itself. T
 - Ramfs mode: enough RAM in `/dev/shm` to hold the compressed image (~4 GB+ devices)
 - Ramfs mode: `xzcat` / `zcat` (for compressed images — present by default on Raspberry Pi OS)
 
-**Local mode (on the device itself):**
-- Root access (run with `sudo`)
-- `busybox`, `findmnt`, `lsblk`, `dd`, `xzcat` / `zcat`
-- Ramfs mode: enough RAM in `/dev/shm` to hold the compressed image
-- Stream mode: image must be on a different block device than the one being flashed
-
 ## Installation
 
 ```bash
 # Clone and symlink
 git clone https://github.com/hatlabs/flash-live-remote.git
-ln -s "$PWD/flash-live-remote/flash-live-remote" /usr/local/bin/
+ln -s "$PWD/flash-live-remote/flash-live-system" /usr/local/bin/
 
 # Or just download the script
-curl -o /usr/local/bin/flash-live-remote \
-  https://raw.githubusercontent.com/hatlabs/flash-live-remote/main/flash-live-remote
-chmod +x /usr/local/bin/flash-live-remote
+curl -o /usr/local/bin/flash-live-system \
+  https://raw.githubusercontent.com/hatlabs/flash-live-remote/main/flash-live-system
+chmod +x /usr/local/bin/flash-live-system
 ```
 
 ## Usage
 
 ```bash
-# Remote (over SSH)
-flash-live-remote [--ramfs|--stream] [--config FILE] <host> <image>
+# Local (default — on the device itself, auto-detects best mode)
+sudo flash-live-system [--ramfs|--stream] [--config FILE] <image>
 
-# Local (on the device itself — auto-detects best mode)
-sudo flash-live-remote --local [--ramfs|--stream] [--config FILE] <image>
+# Remote (over SSH)
+flash-live-system --remote <host> [--ramfs|--stream] [--config FILE] <image>
 ```
 
 Supported image formats: `.img`, `.img.xz`, `.img.gz`
@@ -54,10 +54,10 @@ Use `--config FILE` to pre-configure the flashed image via cloud-init. The confi
 
 ```bash
 # Flash with customization
-flash-live-remote --config myboat.conf halos.local image.img.xz
+sudo flash-live-system --config myboat.conf image.img.xz
 
-# Plain flash, no customization
-flash-live-remote halos.local image.img.xz
+# Remote with customization
+flash-live-system --remote halos.local --config myboat.conf image.img.xz
 ```
 
 Config file format:
@@ -90,35 +90,9 @@ After `dd` completes, the helper mounts the boot partition (FAT32, partition 1) 
 
 **Important:** Customization assumes the new image has a FAT32 boot partition as partition 1. After `dd`, the helper parses the new partition table via `busybox fdisk` and loop-mounts at the correct offset, so the new image's partition layout does not need to match the old one. However, if the new image lacks a FAT32 boot partition, customization will fail (the flash itself still succeeds and the device reboots normally).
 
-### Ramfs mode (default)
+### Local mode (default)
 
-Copies the compressed image to the target's `/dev/shm` (via scp remotely, or `cp` locally), then decompresses and writes it. This is the safest mode — if the transfer fails, no destructive action has happened.
-
-```bash
-# Remote (default ramfs mode)
-flash-live-remote halos.local ~/images/halos-marine.img.xz
-
-# Local (on the device itself)
-sudo flash-live-remote --local ~/images/halos-marine.img.xz
-```
-
-### Stream mode
-
-Decompresses and pipes the image directly to `dd`. In remote mode, the stream goes over SSH. In local mode, the image must be on a different block device (e.g., USB stick) — a safety check prevents streaming from the disk being flashed.
-
-```bash
-# Remote stream
-flash-live-remote --stream pi@192.168.1.100 image.img.xz
-
-# Local stream from USB
-sudo flash-live-remote --local --stream /mnt/usb/image.img.xz
-```
-
-### Local mode
-
-Runs directly on the device being flashed, without SSH. Useful when you have physical access or a console session and want to flash from a locally available image (USB drive, NFS mount, or already in `/dev/shm`).
-
-In local mode, the script **auto-detects** the best flash method:
+Runs directly on the device being flashed, without SSH. The script **auto-detects** the best flash method:
 1. If `/dev/shm` has enough space for the image → uses **ramfs** (safe for same-disk images)
 2. If `/dev/shm` is too small but the image is on a **different disk** → uses **stream**
 3. If `/dev/shm` is too small and the image is on the **same disk** → fails with an error
@@ -127,61 +101,39 @@ You can override auto-detection with `--ramfs` or `--stream`.
 
 ```bash
 # Auto-detect best mode (recommended)
-sudo flash-live-remote --local image.img.xz
+sudo flash-live-system image.img.xz
 
 # Force ramfs (e.g., you know there's enough /dev/shm)
-sudo flash-live-remote --local --ramfs image.img.xz
+sudo flash-live-system --ramfs image.img.xz
 
 # Force stream from USB drive
-sudo flash-live-remote --local --stream /mnt/usb/image.img.xz
+sudo flash-live-system --stream /mnt/usb/image.img.xz
 
 # With first-boot customization
-sudo flash-live-remote --local --config myboat.conf image.img.xz
+sudo flash-live-system --config myboat.conf image.img.xz
 ```
 
-Remote mode still defaults to ramfs and requires explicit `--stream` — network streaming is inherently risky (connection drop = partial image on target).
+### Remote mode
 
-## How it works
+Use `--remote <host>` to flash a device over SSH. Defaults to ramfs mode.
 
-### Ramfs mode
+```bash
+# Remote ramfs (default)
+flash-live-system --remote halos.local ~/images/halos-marine.img.xz
 
+# Remote stream
+flash-live-system --remote pi@192.168.1.100 --stream image.img.xz
 ```
-Dev machine                               Target (Linux SBC)
-───────────                               ──────────────────
-Phase 0: SSH ──────────────────────────── Detect root block device
-         SSH ──────────────────────────── Check /dev/shm capacity, xzcat/zcat
-         SSH ──────────────────────────── Check customization prerequisites*
-         Confirm with user
-         SSH ──────────────────────────── Transfer cloud-init payloads*
-Phase 1: scp image.img.xz ─────────────── /dev/shm/image.img.xz
-         SSH ──────────────────────────── Verify file size matches
-Phase 2: SSH ──────────────────────────── Stop services, sync
-         SSH ──────────────────────────── Deploy helper (copies busybox to tmpfs)
-         SSH ──────────────────────────── Launch helper (detached)
-                                          Helper: xzcat /dev/shm/image | dd
-                                          Helper: loop-mount boot partition*
-                                          Helper: write cloud-init files*
-                                          Helper: reboot -f
-```
-*Only when --config is provided.
+
+### Ramfs mode (default)
+
+Copies the compressed image to the target's `/dev/shm` (via `cp` locally, or scp remotely), then decompresses and writes it. This is the safest mode — if the transfer fails, no destructive action has happened.
 
 ### Stream mode
 
-```
-Dev machine                               Target (Linux SBC)
-───────────                               ──────────────────
-Phase 0: SSH ──────────────────────────── Detect root block device
-         SSH ──────────────────────────── Check customization prerequisites*
-         Confirm with user
-         SSH ──────────────────────────── Transfer cloud-init payloads*
-Phase 1: SSH ──────────────────────────── Deploy helper (copies busybox to tmpfs)
-         SSH ──────────────────────────── Stop services, sync
-Phase 2: xzcat | ssh "helper" ─────────── dd writes to block device
-                                          Helper: loop-mount boot partition*
-                                          Helper: write cloud-init files*
-                                          Helper: reboot -f (via EXIT trap)
-```
-*Only when --config is provided.
+Decompresses and pipes the image directly to `dd`. In remote mode, the stream goes over SSH. In local mode, the image must be on a different block device (e.g., USB stick) — a safety check prevents streaming from the disk being flashed.
+
+## How it works
 
 ### Local ramfs mode
 
@@ -221,10 +173,50 @@ Phase 2: /dev/shm/decompress image | /dev/shm/dd → block device
 ```
 *Only when --config is provided.
 
+### Remote ramfs mode
+
+```
+Dev machine                               Target (Linux SBC)
+───────────                               ──────────────────
+Phase 0: SSH ──────────────────────────── Detect root block device
+         SSH ──────────────────────────── Check /dev/shm capacity, xzcat/zcat
+         SSH ──────────────────────────── Check customization prerequisites*
+         Confirm with user
+         SSH ──────────────────────────── Transfer cloud-init payloads*
+Phase 1: scp image.img.xz ─────────────── /dev/shm/image.img.xz
+         SSH ──────────────────────────── Verify file size matches
+Phase 2: SSH ──────────────────────────── Stop services, sync
+         SSH ──────────────────────────── Deploy helper (copies busybox to tmpfs)
+         SSH ──────────────────────────── Launch helper (detached)
+                                          Helper: xzcat /dev/shm/image | dd
+                                          Helper: loop-mount boot partition*
+                                          Helper: write cloud-init files*
+                                          Helper: reboot -f
+```
+*Only when --config is provided.
+
+### Remote stream mode
+
+```
+Dev machine                               Target (Linux SBC)
+───────────                               ──────────────────
+Phase 0: SSH ──────────────────────────── Detect root block device
+         SSH ──────────────────────────── Check customization prerequisites*
+         Confirm with user
+         SSH ──────────────────────────── Transfer cloud-init payloads*
+Phase 1: SSH ──────────────────────────── Deploy helper (copies busybox to tmpfs)
+         SSH ──────────────────────────── Stop services, sync
+Phase 2: xzcat | ssh "helper" ─────────── dd writes to block device
+                                          Helper: loop-mount boot partition*
+                                          Helper: write cloud-init files*
+                                          Helper: reboot -f (via EXIT trap)
+```
+*Only when --config is provided.
+
 ### Key design decisions
 
-- **Ramfs mode is default**: scp provides a progress bar and pre-flash integrity check (file size verification). If the transfer fails, no destructive action has happened — the device is fully recoverable.
-- **Stream mode uses SSH as transport**: The decompressed image is piped directly through SSH (`xzcat | ssh host "dd ..."`). SSH handles flow control, buffering, and connection lifecycle correctly. When xzcat finishes, SSH sends EOF, dd gets EOF and exits. No nc/ncat needed.
+- **Ramfs mode is default**: scp/cp provides a pre-flash integrity check (file size verification). If the transfer fails, no destructive action has happened — the device is fully recoverable.
+- **Stream mode uses SSH as transport** (remote): The decompressed image is piped directly through SSH (`xzcat | ssh host "dd ..."`). SSH handles flow control, buffering, and connection lifecycle correctly. When xzcat finishes, SSH sends EOF, dd gets EOF and exits. No nc/ncat needed.
 - **No pivot_root or unmount**: `dd` writes to the raw block device, bypassing the mounted filesystem. `reboot -f` skips sync so the old filesystem cache doesn't write back.
 - **Resolved binary paths**: After dd overwrites the disk, PATH lookups against the rootfs may fail (page cache eviction). All helpers resolve binary paths (busybox, dd) before dd starts. Local stream mode additionally copies the decompressor to tmpfs since it runs concurrently with dd in the same pipe.
 - **EXIT trap (stream mode)**: The helper uses `trap 'busybox reboot -f' EXIT` to ensure reboot happens even if the SSH session drops during or after the write.
@@ -232,16 +224,16 @@ Phase 2: /dev/shm/decompress image | /dev/shm/dd → block device
 
 ## Choosing a mode
 
-| | Ramfs (default) | Stream | Local ramfs | Local stream |
+| | Local ramfs | Local stream | Remote ramfs (default) | Remote stream |
 |---|---|---|---|---|
-| **Safety** | Pre-flash integrity check | Transfer failure = partial image | Pre-flash integrity check | Requires image on separate disk |
-| **Progress** | scp progress bar | None (dd reports at end) | cp progress (if terminal) | None (dd reports at end) |
+| **Safety** | Pre-flash integrity check | Requires image on separate disk | Pre-flash integrity check | Transfer failure = partial image |
+| **Progress** | cp progress (if terminal) | None (dd reports at end) | scp progress bar | None (dd reports at end) |
 | **RAM required** | Compressed image in /dev/shm | Minimal | Compressed image in /dev/shm | Minimal |
-| **Speed** | Fast (local decompress + NVMe) | Network-bound | Fast | Fast (local I/O only) |
-| **Needs SSH** | Yes | Yes | No | No |
-| **Needs root** | No (sudo on target) | No (sudo on target) | Yes | Yes |
+| **Speed** | Fast | Fast (local I/O only) | Fast (local decompress + NVMe) | Network-bound |
+| **Needs SSH** | No | No | Yes | Yes |
+| **Needs root** | Yes | Yes | No (sudo on target) | No (sudo on target) |
 
-In remote mode, use `--stream` for devices with less than ~4 GB RAM where the compressed image won't fit in `/dev/shm`. Use `--local` when you have physical/console access — it auto-detects the best mode, so you typically don't need to specify `--ramfs` or `--stream`.
+In local mode (default), the script auto-detects the best mode, so you typically don't need to specify `--ramfs` or `--stream`. Use `--remote <host>` for devices you can reach over SSH — use `--stream` for remote devices with less than ~4 GB RAM where the compressed image won't fit in `/dev/shm`.
 
 ## Limitations
 
