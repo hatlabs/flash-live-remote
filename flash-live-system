@@ -321,12 +321,25 @@ fi
 
 # Mode-specific prerequisites
 if [ -z "$remote_host" ]; then
+  if [ "$(uname -s)" != "Linux" ]; then
+    echo "Error: local mode requires Linux (detected $(uname -s))" >&2
+    exit 1
+  fi
   if [ "$(id -u)" -ne 0 ]; then
     echo "Error: local mode must be run as root (use sudo)" >&2
     exit 1
   fi
+  if [ "$(uname -m)" != "aarch64" ]; then
+    echo "Error: local architecture is $(uname -m) (expected aarch64)" >&2
+    exit 1
+  fi
 else
   _require ssh scp
+  ssh_err=$(ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$remote_host" true 2>&1) || {
+    echo "Error: cannot connect to $remote_host via SSH" >&2
+    [ -n "$ssh_err" ] && echo "  $ssh_err" >&2
+    exit 1
+  }
   if [ "$mode" = "stream" ]; then
     _require "$decompress_cmd"
   fi
@@ -368,6 +381,24 @@ pipe_to_target() {
   fi
 }
 
+check_target_device() {
+  local arch model
+
+  arch=$(run_on_target "uname -m")
+  if [ "$arch" != "aarch64" ]; then
+    echo "Error: target architecture is $arch (expected aarch64)" >&2
+    exit 1
+  fi
+
+  model=$(run_on_target "cat /sys/firmware/devicetree/base/model 2>/dev/null | tr -d '\0'" 2>/dev/null || echo "")
+  if [ -n "$model" ]; then
+    echo "Target device: $model"
+    if ! echo "$model" | grep -qi "raspberry pi"; then
+      echo "Note: this is not a Raspberry Pi — verify the image is compatible"
+    fi
+  fi
+}
+
 target_label() {
   if [ -z "$remote_host" ]; then
     echo "local device"
@@ -398,6 +429,8 @@ if ! run_on_target "test -b '$root_dev'"; then
   echo "Error: $root_dev is not a valid block device on $(target_label)" >&2
   exit 1
 fi
+
+check_target_device
 
 dev_size=$(run_on_target "lsblk -bno SIZE '$root_dev' | head -1")
 dev_size_gb=$((dev_size / 1073741824))
