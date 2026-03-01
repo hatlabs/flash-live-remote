@@ -10,6 +10,17 @@ _require() {
   done
 }
 
+# --- BEGIN _extract_busybox ---
+_extract_busybox() {
+  # Source version stub. ./run build replaces this with the real binary.
+  # The built version uses `base64 -d` (coreutils) — a bootstrap dependency
+  # needed before busybox itself is available.
+  echo "Error: this is the source version of flash-live-system." >&2
+  echo "Run './run build' to produce a release artifact, or download from GitHub Releases." >&2
+  return 1
+}
+# --- END _extract_busybox ---
+
 # --- Config file parser ---
 
 parse_config() {
@@ -112,9 +123,8 @@ if [ $# -lt 1 ]; then
   echo "  flash-live-system --remote halos.local --stream image.img" >&2
   echo "" >&2
   echo "Prerequisites:" >&2
-  echo "  Local:  root access, xzcat/zcat (for compressed images)" >&2
-  echo "  Remote: ssh, scp, xzcat/zcat (for compressed images)" >&2
-  echo "  Target: busybox (with fdisk, losetup, mount, umount applets for customization)" >&2
+  echo "  Local:  root access" >&2
+  echo "  Remote: ssh, scp" >&2
   exit 1
 fi
 
@@ -297,7 +307,6 @@ if [ -z "$remote_host" ]; then
     echo "Error: local mode must be run as root (use sudo)" >&2
     exit 1
   fi
-  _require "$decompress_cmd"
 else
   _require ssh scp
   if [ "$mode" = "stream" ]; then
@@ -336,6 +345,7 @@ pipe_to_target() {
   if [ -z "$remote_host" ]; then
     bash -c "$1"
   else
+    # shellcheck disable=SC2029  # $1 is intentionally expanded client-side
     ssh "$remote_host" "$1"
   fi
 }
@@ -351,12 +361,6 @@ target_label() {
 # --- Phase 0: Resolve hostname and detect target device ---
 
 echo "=== Phase 0: Detecting target device ==="
-
-# Verify busybox is available on target
-if ! run_on_target "command -v busybox" >/dev/null 2>&1; then
-  echo "Error: busybox not found on $(target_label) (required for flash helper)" >&2
-  exit 1
-fi
 
 # Detect root block device
 root_part=$(run_on_target "findmnt -no SOURCE /")
@@ -415,14 +419,6 @@ if [ "$mode" = "ramfs" ]; then
     exit 1
   fi
   echo "Target /dev/shm: ${shm_avail_mb} MB available (need ${image_size_mb} MB + margin)"
-
-  # Check decompression tool on target
-  if [ "$decompress_cmd" != "cat" ]; then
-    if ! run_on_target "command -v $decompress_cmd" >/dev/null 2>&1; then
-      echo "Error: $decompress_cmd not found on $(target_label) (required for decompression)" >&2
-      exit 1
-    fi
-  fi
 fi
 
 # Preflight checks for customization capabilities on target
@@ -434,14 +430,6 @@ if [ "$has_customization" = true ]; then
     echo "Error: kernel on $(target_label) lacks vfat support (required for customization)" >&2
     exit 1
   fi
-
-  # Verify busybox has required applets for loop-mount boot partition
-  for applet in fdisk losetup; do
-    if ! run_on_target "busybox $applet --help" >/dev/null 2>&1; then
-      echo "Error: busybox on $(target_label) lacks $applet applet (required for customization)" >&2
-      exit 1
-    fi
-  done
 fi
 
 # --- Confirmation prompt ---
@@ -484,6 +472,23 @@ if [ "$confirm" != "yes" ]; then
   echo "Aborted."
   exit 1
 fi
+
+# Deploy embedded busybox to target
+echo ""
+echo "Deploying embedded busybox to target..."
+if [ -z "$remote_host" ]; then
+  _extract_busybox /dev/shm/busybox
+else
+  _bb_tmp="/tmp/flash-busybox-$$"
+  # Clean up temp file on failure (set -e would skip the rm)
+  _extract_busybox "$_bb_tmp" || { rm -f "$_bb_tmp"; exit 1; }
+  scp -O "$_bb_tmp" "$remote_host:/dev/shm/busybox" || { rm -f "$_bb_tmp"; exit 1; }
+  rm -f "$_bb_tmp"
+fi
+run_on_target "chmod +x /dev/shm/busybox"
+# Sanity check: catch truncated/corrupted binary before we get confusing errors later
+run_on_target "/dev/shm/busybox --help >/dev/null 2>&1" \
+  || { echo "Error: deployed busybox binary is not executable (truncated or corrupted?)" >&2; exit 1; }
 
 # Transfer customization payloads to target (after confirmation to avoid
 # leaving sensitive data on target if the user aborts)
@@ -569,43 +574,34 @@ deploy_ramfs_helper() {
   # the image from /dev/shm, writes it to the block device, applies
   # customization, and reboots. All variable values are passed as arguments
   # to avoid shell metacharacter issues.
+  #
+  # The embedded busybox is already deployed to /dev/shm/busybox before this
+  # function is called. No binary copies needed — busybox provides all applets.
   pipe_to_target "cat > /dev/shm/flash-helper.sh && chmod +x /dev/shm/flash-helper.sh" <<'HELPER_EOF'
 #!/bin/bash
 
 # Phase 1 — runs under /bin/bash from rootfs (safe: dd hasn't started yet).
-# Copy all needed binaries to tmpfs and re-exec under busybox sh so that
-# NOTHING running after dd depends on rootfs pages.
+# Re-exec under busybox sh from tmpfs so that NOTHING running after dd
+# depends on rootfs pages. Busybox is already on /dev/shm (deployed by
+# the host script before transfer).
 
 if [ -z "$_FLASH_REEXEC" ]; then
-  IMAGE_PATH="$1"
-  TARGET_DEV="$2"
-  DECOMPRESS_CMD="$3"
-
-  BUSYBOX_SRC=$(command -v busybox)
-  DD_SRC=$(command -v dd)
-  DECOMPRESS_SRC=$(command -v "$DECOMPRESS_CMD")
-
-  cp "$BUSYBOX_SRC" /dev/shm/busybox
-  cp "$DD_SRC" /dev/shm/dd
-  cp "$DECOMPRESS_SRC" /dev/shm/decompress
-  chmod +x /dev/shm/busybox /dev/shm/dd /dev/shm/decompress
-
   export _FLASH_REEXEC=1
   exec /dev/shm/busybox sh "$0" "$@"
 fi
 
-# Phase 2 — runs under busybox sh from tmpfs. All binaries on tmpfs.
-# No rootfs dependencies from this point on.
+# Phase 2 — runs under busybox sh from tmpfs. No rootfs dependencies.
 set -eo pipefail
 
 IMAGE_PATH="$1"
 TARGET_DEV="$2"
+DECOMPRESS_CMD="$3"
 BUSYBOX=/dev/shm/busybox
 
 trap '"$BUSYBOX" reboot -f 2>/dev/null || { echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger; }' EXIT
 
 echo "flash-helper: decompressing and writing $IMAGE_PATH -> $TARGET_DEV"
-/dev/shm/decompress "$IMAGE_PATH" | /dev/shm/dd of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
+"$BUSYBOX" "$DECOMPRESS_CMD" "$IMAGE_PATH" | "$BUSYBOX" dd of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
 echo "flash-helper: dd complete:"
 "$BUSYBOX" cat /dev/shm/dd-status 2>/dev/null || true
 
@@ -669,37 +665,27 @@ flash_stream() {
   echo "=== Phase 1: Preparing target ==="
 
   # Deploy helper script — reads image data from stdin (piped via SSH),
-  # writes to block device, then reboots.
+  # writes to block device, then reboots. Busybox is already on /dev/shm.
   ssh "$remote_host" "cat > /dev/shm/flash-helper.sh" <<'HELPER_EOF'
 #!/bin/bash
 
 # Phase 1 — runs under /bin/bash from rootfs (safe: dd hasn't started yet).
-# Copy all needed binaries to tmpfs and re-exec under busybox sh.
-# Stream mode: stdin carries the image data, but re-exec preserves stdin
-# because exec replaces the process in-place (same fd table).
+# Re-exec under busybox sh from tmpfs. Stream mode: stdin carries the image
+# data, but re-exec preserves stdin (exec replaces process in-place).
 
 if [ -z "$_FLASH_REEXEC" ]; then
-  TARGET_DEV="$1"
-
-  BUSYBOX_SRC=$(command -v busybox)
-  DD_SRC=$(command -v dd)
-
-  cp "$BUSYBOX_SRC" /dev/shm/busybox
-  cp "$DD_SRC" /dev/shm/dd
-  chmod +x /dev/shm/busybox /dev/shm/dd
-
   export _FLASH_REEXEC=1
   exec /dev/shm/busybox sh "$0" "$@"
 fi
 
-# Phase 2 — runs under busybox sh from tmpfs.
+# Phase 2 — runs under busybox sh from tmpfs. No rootfs dependencies.
 TARGET_DEV="$1"
 BUSYBOX=/dev/shm/busybox
 
 trap '"$BUSYBOX" reboot -f 2>/dev/null || { echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger; }' EXIT
 
 echo "flash-helper: writing stdin -> $TARGET_DEV"
-/dev/shm/dd of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
+"$BUSYBOX" dd of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
 "$BUSYBOX" cat /dev/shm/dd-status 2>/dev/null || true
 echo "flash-helper: dd complete"
 
@@ -808,20 +794,7 @@ flash_local_stream() {
   systemctl stop 'container-*' 'marine-*' 'halos-*' cockpit docker 2>/dev/null || true
   sync
 
-  # Copy all binaries to tmpfs BEFORE dd overwrites the rootfs.
-  BUSYBOX_SRC=$(command -v busybox)
-  DD_SRC=$(command -v dd)
-
-  cp "$BUSYBOX_SRC" /dev/shm/busybox
-  cp "$DD_SRC" /dev/shm/dd
-  chmod +x /dev/shm/busybox /dev/shm/dd
-
-  if [ "$decompress_cmd" != "cat" ]; then
-    DECOMPRESS_SRC=$(command -v "$decompress_cmd")
-    cp "$DECOMPRESS_SRC" /dev/shm/decompress
-    chmod +x /dev/shm/decompress
-  fi
-
+  # Busybox is already on /dev/shm (deployed before payload transfer).
   # Write helper script to tmpfs. This will be exec'd under busybox sh
   # so that NOTHING running during/after dd depends on rootfs pages.
   cat > /dev/shm/flash-local-stream.sh <<'LOCAL_STREAM_EOF'
@@ -835,11 +808,7 @@ BUSYBOX=/dev/shm/busybox
 trap '"$BUSYBOX" reboot -f 2>/dev/null || { echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger; }' EXIT
 
 echo "flash-helper: decompressing and writing $IMAGE -> $TARGET_DEV"
-if [ "$DECOMPRESS_CMD" = "cat" ]; then
-  "$BUSYBOX" cat "$IMAGE" | /dev/shm/dd of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
-else
-  /dev/shm/decompress "$IMAGE" | /dev/shm/dd of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
-fi
+"$BUSYBOX" "$DECOMPRESS_CMD" "$IMAGE" | "$BUSYBOX" dd of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
 echo "flash-helper: dd complete:"
 "$BUSYBOX" cat /dev/shm/dd-status 2>/dev/null || true
 
