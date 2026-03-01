@@ -96,6 +96,24 @@ wifi-country=FI
 
 Tilde (`~/`) in `ssh-key` paths is expanded automatically. The `ssh-key` key can appear multiple times to add multiple keys.
 
+### Confirmation prompt
+
+Before flashing, the tool requires you to type a target-specific phrase to confirm:
+
+```
+Type "nuke halos.local from orbit" to proceed:
+```
+
+For local mode, the phrase uses `localhost` as the target.
+
+For scripted/CI usage, pass both `--yes` and `--yes-i-really-mean-it` to skip the prompt:
+
+```bash
+sudo flash-live-system --yes --yes-i-really-mean-it image.img.xz
+```
+
+Using only `--yes` without `--yes-i-really-mean-it` is an error — both flags are required together to prevent accidental bypasses.
+
 After `dd` completes, the helper mounts the boot partition (FAT32, partition 1) and writes `user-data` and/or `network-config` files for cloud-init. If no config file is given, behavior is identical to a plain flash.
 
 **Important:** Customization assumes the new image has a FAT32 boot partition as partition 1. After `dd`, the helper parses the new partition table via `busybox fdisk` and loop-mounts at the correct offset, so the new image's partition layout does not need to match the old one. However, if the new image lacks a FAT32 boot partition, customization will fail (the flash itself still succeeds and the device reboots normally).
