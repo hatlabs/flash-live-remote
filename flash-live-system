@@ -575,6 +575,130 @@ if [ "$has_customization" = true ]; then
   pipe_to_target "cat > /dev/shm/apply-customization.sh" <<'CUSTOMIZATION_EOF'
 # Sourced script — no shebang. Expects $BUSYBOX and $TARGET_DEV from caller.
 
+# Relabel a FAT32 partition from "bootfs" to "CIDATA" using raw byte writes.
+# Cloud-init discovers seed files via blkid LABEL lookup, which works even
+# before the partition is mounted — fixing the mount race on RPi OS trixie.
+# See: https://github.com/hatlabs/flash-live-system/issues/16
+#
+# Args: $1 = loop device (raw partition), $2 = busybox path
+# Returns 0 on success or if relabeling is skipped (non-fatal).
+relabel_fat32_cidata() {
+  local dev="$1" bb="$2"
+
+  # --- helpers for little-endian BPB field reads ---
+  # All offsets are relative to the loop device (= partition start).
+  # NF guard handles any blank lines from busybox od.
+  read_le16() {
+    "$bb" dd if="$dev" bs=1 skip="$1" count=2 2>/dev/null \
+      | "$bb" od -A n -t u1 | "$bb" awk 'NF{print $1 + $2 * 256; exit}'
+  }
+  read_le32() {
+    "$bb" dd if="$dev" bs=1 skip="$1" count=4 2>/dev/null \
+      | "$bb" od -A n -t u1 \
+      | "$bb" awk 'NF{print $1 + $2*256 + $3*65536 + $4*16777216; exit}'
+  }
+  read_u8() {
+    "$bb" dd if="$dev" bs=1 skip="$1" count=1 2>/dev/null \
+      | "$bb" od -A n -t u1 | "$bb" awk 'NF{print $1; exit}'
+  }
+  read_bytes() {
+    "$bb" dd if="$dev" bs=1 skip="$1" count="$2" 2>/dev/null
+  }
+
+  # 1. Validate FAT32 signature (BS_FilSysType at offset 82, 8 bytes)
+  local fstype
+  fstype=$(read_bytes 82 8)
+  case "$fstype" in
+    FAT32*) ;;
+    *)
+      echo "relabel: not FAT32 (signature: '$fstype'), skipping"
+      return 0 ;;
+  esac
+
+  # 2. Validate bytes_per_sector == 512 (before any offset-dependent reads)
+  local bps
+  bps=$(read_le16 11)
+  if [ "$bps" -ne 512 ]; then
+    echo "relabel: unexpected bytes_per_sector=$bps, skipping"
+    return 0
+  fi
+
+  # 3. Validate current boot sector label is "bootfs" (BS_VolLab at offset 71)
+  local cur_label
+  cur_label=$(read_bytes 71 11)
+  if [ "$cur_label" != "bootfs     " ]; then
+    echo "relabel: boot sector label is '$cur_label', not 'bootfs', skipping"
+    return 0
+  fi
+
+  # 4. Parse BPB fields to locate root directory
+  local spc reserved num_fats fat_size root_cluster bk_boot_sec
+  spc=$(read_u8 13)
+  reserved=$(read_le16 14)
+  num_fats=$(read_u8 16)
+  fat_size=$(read_le32 36)
+  root_cluster=$(read_le32 44)
+  bk_boot_sec=$(read_le16 50)
+
+  if [ "$root_cluster" -lt 2 ]; then
+    echo "relabel: invalid root_cluster=$root_cluster, skipping"
+    return 0
+  fi
+
+  local root_sector=$((reserved + num_fats * fat_size + (root_cluster - 2) * spc))
+  local root_offset=$((root_sector * 512))
+
+  # 5. Validate root directory volume label entry
+  #    First entry should be the volume label (attr byte = 0x08)
+  local attr_byte
+  attr_byte=$(read_u8 $((root_offset + 11)))
+  if [ -z "$attr_byte" ] || [ "$attr_byte" -ne 8 ]; then
+    echo "relabel: root dir entry attr=${attr_byte:-empty}, not 8, skipping"
+    return 0
+  fi
+  local dir_label
+  dir_label=$(read_bytes "$root_offset" 11)
+  if [ "$dir_label" != "bootfs     " ]; then
+    echo "relabel: root dir label is '$dir_label', not 'bootfs', skipping"
+    return 0
+  fi
+
+  # 6. Write "CIDATA     " (6-char name + 5 spaces = 11-byte FAT label)
+  #    to all three locations. Errors are logged but non-fatal.
+  local new_label="CIDATA     "
+  local write_ok=true
+
+  # Boot sector BS_VolLab (offset 71)
+  if ! "$bb" printf '%s' "$new_label" \
+    | "$bb" dd of="$dev" bs=1 seek=71 count=11 conv=notrunc 2>/dev/null; then
+    echo "relabel: WARNING: failed to write boot sector label"
+    write_ok=false
+  fi
+
+  # Backup boot sector BS_VolLab (sector bk_boot_sec, relative to partition)
+  if [ "$bk_boot_sec" -gt 0 ] && [ "$bk_boot_sec" -lt "$reserved" ]; then
+    local bk_offset=$((bk_boot_sec * 512 + 71))
+    if ! "$bb" printf '%s' "$new_label" \
+      | "$bb" dd of="$dev" bs=1 seek="$bk_offset" count=11 conv=notrunc 2>/dev/null; then
+      echo "relabel: WARNING: failed to write backup boot sector label"
+      write_ok=false
+    fi
+  fi
+
+  # Root directory volume label entry
+  if ! "$bb" printf '%s' "$new_label" \
+    | "$bb" dd of="$dev" bs=1 seek="$root_offset" count=11 conv=notrunc 2>/dev/null; then
+    echo "relabel: WARNING: failed to write root dir label"
+    write_ok=false
+  fi
+
+  if [ "$write_ok" = true ]; then
+    echo "relabel: boot partition relabeled to CIDATA"
+  else
+    echo "relabel: WARNING: relabeling partially failed, cloud-init may not discover seed files"
+  fi
+}
+
 if [ ! -f /dev/shm/custom-user-data ] && [ ! -f /dev/shm/custom-network-config ]; then
   return 0
 fi
@@ -621,6 +745,9 @@ if "$BUSYBOX" mount -t vfat "$LOOP_DEV" /dev/shm/bootmnt; then
   # writing back old rootfs dirty pages over the new image.
   "$BUSYBOX" umount /dev/shm/bootmnt
   echo "apply-customization: boot partition customization applied"
+
+  # Relabel boot partition to CIDATA for cloud-init discovery.
+  relabel_fat32_cidata "$LOOP_DEV" "$BUSYBOX"
 else
   echo "apply-customization: ERROR: could not mount boot partition for customization"
 fi
