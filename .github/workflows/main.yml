@@ -113,21 +113,20 @@ jobs:
           TAG="v${VERSION}+${REVISION}"
           git tag "$TAG"
           git push origin "$TAG"
-          NOTES="$(cat <<NOTES
-## flash-live-system $TAG
-
-Built from $(git rev-parse --short HEAD).
-
-### Installation
-
-\`\`\`bash
-curl -Lo /usr/local/bin/flash-live-system \\
-  https://github.com/${{ github.repository }}/releases/download/${TAG}/flash-live-system
-chmod +x /usr/local/bin/flash-live-system
-\`\`\`
-NOTES
-          )"
+          {
+            echo "## flash-live-system $TAG"
+            echo ""
+            echo "Built from $(git rev-parse --short HEAD)."
+            echo ""
+            echo "### Installation"
+            echo ""
+            echo '```bash'
+            echo "curl -Lo /usr/local/bin/flash-live-system \\"
+            echo "  https://github.com/${{ github.repository }}/releases/download/${TAG}/flash-live-system"
+            echo "chmod +x /usr/local/bin/flash-live-system"
+            echo '```'
+          } > /tmp/release-notes.md
           gh release create "$TAG" dist/flash-live-system \
             --title "$TAG" \
             --draft \
-            --notes "$NOTES"
+            --notes-file /tmp/release-notes.md
