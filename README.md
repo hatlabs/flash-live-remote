@@ -118,6 +118,22 @@ After `dd` completes, the helper mounts the boot partition (FAT32, partition 1) 
 
 **Important:** Customization assumes the new image has a FAT32 boot partition as partition 1. After `dd`, the helper parses the new partition table via `busybox fdisk` and loop-mounts at the correct offset, so the new image's partition layout does not need to match the old one. However, if the new image lacks a FAT32 boot partition, customization will fail (the flash itself still succeeds and the device reboots normally).
 
+#### Known issues with cloud-init on some images
+
+flash-live-system places `user-data` and `network-config` files on the boot partition and relabels it to `CIDATA` so that cloud-init discovers them via `blkid`. Whether cloud-init actually processes these files depends on the image's cloud-init configuration — flash-live-system has no control over the image's cloud-init behavior.
+
+**RPi OS trixie**: Stock Raspberry Pi OS trixie images ship with `99_raspberry-pi.cfg` containing `seedfrom: file:///boot/firmware`, which causes cloud-init to read seed data from the filesystem mount path instead of the `CIDATA` partition discovered via `blkid`. Because `/boot/firmware` may not be mounted when cloud-init runs, the `seedfrom` directive can race with the mount and produce unpredictable results — config may be applied partially or not at all. This is a known upstream issue ([RPi-Distro/rpi-cloud-init-mods#2](https://github.com/RPi-Distro/rpi-cloud-init-mods/issues/2), [canonical/cloud-init#6614](https://github.com/canonical/cloud-init/issues/6614)).
+
+**Workaround**: The upstream fix adds `RequiresMountsFor=/boot/firmware` to `cloud-init-main.service`, ensuring the mount is available before cloud-init runs. Users can apply this manually on a running system:
+
+```bash
+sudo mkdir -p /etc/systemd/system/cloud-init-main.service.d
+printf '[Unit]\nRequiresMountsFor=/boot/firmware\n' | \
+  sudo tee /etc/systemd/system/cloud-init-main.service.d/mount-bootfs.conf
+```
+
+**HaLOS images** are not affected — they do not use cloud-init for first-boot configuration.
+
 ### Local mode (default)
 
 Runs directly on the device being flashed, without SSH. The script **auto-detects** the best flash method:
