@@ -42,7 +42,7 @@ chmod +x /usr/local/bin/flash-live-remote
 # Remote (over SSH)
 flash-live-remote [--ramfs|--stream] [--config FILE] <host> <image>
 
-# Local (on the device itself)
+# Local (on the device itself — auto-detects best mode)
 sudo flash-live-remote --local [--ramfs|--stream] [--config FILE] <image>
 ```
 
@@ -118,18 +118,28 @@ sudo flash-live-remote --local --stream /mnt/usb/image.img.xz
 
 Runs directly on the device being flashed, without SSH. Useful when you have physical access or a console session and want to flash from a locally available image (USB drive, NFS mount, or already in `/dev/shm`).
 
+In local mode, the script **auto-detects** the best flash method:
+1. If `/dev/shm` has enough space for the image → uses **ramfs** (safe for same-disk images)
+2. If `/dev/shm` is too small but the image is on a **different disk** → uses **stream**
+3. If `/dev/shm` is too small and the image is on the **same disk** → fails with an error
+
+You can override auto-detection with `--ramfs` or `--stream`.
+
 ```bash
-# Flash from local storage (ramfs, default — safe for same-disk images)
+# Auto-detect best mode (recommended)
 sudo flash-live-remote --local image.img.xz
 
-# Flash from USB drive (stream — avoids /dev/shm size constraint)
+# Force ramfs (e.g., you know there's enough /dev/shm)
+sudo flash-live-remote --local --ramfs image.img.xz
+
+# Force stream from USB drive
 sudo flash-live-remote --local --stream /mnt/usb/image.img.xz
 
 # With first-boot customization
 sudo flash-live-remote --local --config myboat.conf image.img.xz
 ```
 
-Local ramfs mode copies the image to `/dev/shm` first, making it safe even when the image is on the disk being flashed. Local stream mode reads the image directly during `dd`, so it requires the image to be on a separate block device.
+Remote mode still defaults to ramfs and requires explicit `--stream` — network streaming is inherently risky (connection drop = partial image on target).
 
 ## How it works
 
@@ -231,7 +241,7 @@ Phase 2: /dev/shm/decompress image | /dev/shm/dd → block device
 | **Needs SSH** | Yes | Yes | No | No |
 | **Needs root** | No (sudo on target) | No (sudo on target) | Yes | Yes |
 
-Use `--stream` for devices with less than ~4 GB RAM where the compressed image won't fit in `/dev/shm`. Use `--local` when you have physical/console access to the device.
+In remote mode, use `--stream` for devices with less than ~4 GB RAM where the compressed image won't fit in `/dev/shm`. Use `--local` when you have physical/console access — it auto-detects the best mode, so you typically don't need to specify `--ramfs` or `--stream`.
 
 ## Limitations
 

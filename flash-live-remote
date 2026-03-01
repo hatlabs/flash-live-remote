@@ -46,6 +46,7 @@ parse_config() {
 # --- Argument parsing ---
 
 mode="ramfs"
+mode_explicit=false
 local_mode=false
 custom_hostname=""
 custom_user=""
@@ -57,8 +58,8 @@ wifi_country="GB"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ramfs)  mode="ramfs";  shift ;;
-    --stream) mode="stream"; shift ;;
+    --ramfs)  mode="ramfs";  mode_explicit=true; shift ;;
+    --stream) mode="stream"; mode_explicit=true; shift ;;
     --local)  local_mode=true; shift ;;
     --config)
       if [ $# -lt 2 ]; then
@@ -88,9 +89,10 @@ if [ $# -lt "$required_args" ]; then
   echo "Flash an image to a Linux device, either remotely over SSH or locally." >&2
   echo "" >&2
   echo "Modes:" >&2
-  echo "  --ramfs            (default) Copy image to /dev/shm, then decompress+dd" >&2
+  echo "  --ramfs            Copy image to /dev/shm, then decompress+dd (remote default)" >&2
   echo "  --stream           Stream image directly (over SSH, or from another disk locally)" >&2
   echo "  --local            Run on the device being flashed (no SSH, must be root)" >&2
+  echo "                     Auto-detects ramfs vs stream based on /dev/shm space and disk layout" >&2
   echo "" >&2
   echo "First-boot customization:" >&2
   echo "  --config FILE      Config file with key=value settings for first-boot customization." >&2
@@ -104,8 +106,10 @@ if [ $# -lt "$required_args" ]; then
   echo "  flash-live-remote --stream pi@192.168.1.100 image.img" >&2
   echo "" >&2
   echo "Examples (local):" >&2
-  echo "  sudo flash-live-remote --local image.img.xz" >&2
-  echo "  sudo flash-live-remote --local --stream --config myboat.conf /mnt/usb/image.img.xz" >&2
+  echo "  sudo flash-live-remote --local image.img.xz                    # auto-detects best mode" >&2
+  echo "  sudo flash-live-remote --local --ramfs image.img.xz            # force ramfs" >&2
+  echo "  sudo flash-live-remote --local --stream /mnt/usb/image.img.xz  # force stream" >&2
+  echo "  sudo flash-live-remote --local --config myboat.conf image.img.xz" >&2
   echo "" >&2
   echo "Prerequisites:" >&2
   echo "  Remote: ssh, scp, xzcat/zcat (for compressed images)" >&2
@@ -365,6 +369,35 @@ fi
 
 dev_size=$(run_on_target "lsblk -bno SIZE '$root_dev' | head -1")
 dev_size_gb=$((dev_size / 1073741824))
+
+# Auto-detect flash mode for local when not explicitly set
+if [ "$local_mode" = true ] && [ "$mode_explicit" = false ]; then
+  shm_avail=$(run_on_target "df -B1 --output=avail /dev/shm | tail -1 | tr -d ' '")
+  margin_bytes=209715200  # 200 MB
+  required=$((image_size + margin_bytes))
+  if [ "$shm_avail" -ge "$required" ]; then
+    mode="ramfs"
+    echo "Auto-selected ramfs mode (/dev/shm has sufficient space)"
+  else
+    # Not enough shm — check if image is on a different disk than the target
+    image_mount=$(findmnt -no SOURCE --target "$image")
+    image_on_same_disk=false
+    if [ -n "$image_mount" ]; then
+      image_parent=$(lsblk -ndo PKNAME "$image_mount" 2>/dev/null || true)
+      if [ -n "$image_parent" ] && [ "/dev/$image_parent" = "$root_dev" ]; then
+        image_on_same_disk=true
+      fi
+    fi
+    if [ "$image_on_same_disk" = true ]; then
+      echo "Error: insufficient /dev/shm space and image is on the target disk ($root_dev)" >&2
+      echo "  /dev/shm available: $((shm_avail / 1048576)) MB, required: $((required / 1048576)) MB" >&2
+      echo "  Cannot flash safely. Move the image to a USB drive or free up RAM." >&2
+      exit 1
+    fi
+    mode="stream"
+    echo "Auto-selected stream mode (insufficient /dev/shm, image on separate disk)"
+  fi
+fi
 
 # Mode-specific preflight checks
 if [ "$mode" = "ramfs" ]; then
