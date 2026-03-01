@@ -27,12 +27,12 @@ Flash a Linux SBC — locally on the device itself or over the network. Transfer
 
 ```bash
 # Clone and symlink
-git clone https://github.com/hatlabs/flash-live-remote.git
-ln -s "$PWD/flash-live-remote/flash-live-system" /usr/local/bin/
+git clone https://github.com/hatlabs/flash-live-system.git
+ln -s "$PWD/flash-live-system/flash-live-system" /usr/local/bin/
 
 # Or just download the script
 curl -o /usr/local/bin/flash-live-system \
-  https://raw.githubusercontent.com/hatlabs/flash-live-remote/main/flash-live-system
+  https://raw.githubusercontent.com/hatlabs/flash-live-system/main/flash-live-system
 chmod +x /usr/local/bin/flash-live-system
 ```
 
