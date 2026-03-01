@@ -47,7 +47,7 @@ parse_config() {
 
 mode="ramfs"
 mode_explicit=false
-local_mode=false
+remote_host=""
 margin_bytes=209715200  # 200 MB safety margin for /dev/shm checks
 custom_hostname=""
 custom_user=""
@@ -61,7 +61,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --ramfs)  mode="ramfs";  mode_explicit=true; shift ;;
     --stream) mode="stream"; mode_explicit=true; shift ;;
-    --local)  local_mode=true; shift ;;
+    --remote)
+      if [ $# -lt 2 ]; then
+        echo "Error: --remote requires a host argument" >&2
+        exit 1
+      fi
+      remote_host="$2"; shift 2 ;;
     --config)
       if [ $# -lt 2 ]; then
         echo "Error: --config requires a file path" >&2
@@ -71,61 +76,49 @@ while [[ $# -gt 0 ]]; do
     -*)
       echo "Error: unknown option '$1'" >&2
       echo "" >&2
-      echo "Usage: flash-live-remote [--local] [--ramfs|--stream] [--config FILE] [<host>] <image>" >&2
+      echo "Usage: flash-live-system [--remote <host>] [--ramfs|--stream] [--config FILE] <image>" >&2
       exit 1
       ;;
     *) break ;;
   esac
 done
 
-if [ "$local_mode" = true ]; then
-  required_args=1
-else
-  required_args=2
-fi
-
-if [ $# -lt "$required_args" ]; then
-  echo "Usage: flash-live-remote [--local] [--ramfs|--stream] [--config FILE] [<host>] <image>" >&2
+if [ $# -lt 1 ]; then
+  echo "Usage: flash-live-system [--remote <host>] [--ramfs|--stream] [--config FILE] <image>" >&2
   echo "" >&2
-  echo "Flash an image to a Linux device, either remotely over SSH or locally." >&2
+  echo "Flash an image to a Linux device, either locally or remotely over SSH." >&2
   echo "" >&2
-  echo "Modes:" >&2
-  echo "  --ramfs            Copy image to /dev/shm, then decompress+dd (remote default)" >&2
+  echo "Options:" >&2
+  echo "  --remote <host>    Flash a remote device over SSH (default: flash locally)" >&2
+  echo "  --ramfs            Force ramfs mode: copy image to /dev/shm, then decompress+dd" >&2
   echo "  --stream           Stream image directly (over SSH, or from another disk locally)" >&2
-  echo "  --local            Run on the device being flashed (no SSH, must be root)" >&2
-  echo "                     Auto-detects ramfs vs stream based on /dev/shm space and disk layout" >&2
-  echo "" >&2
-  echo "First-boot customization:" >&2
   echo "  --config FILE      Config file with key=value settings for first-boot customization." >&2
   echo "                     See example.conf for available keys and format." >&2
   echo "" >&2
+  echo "In local mode (default), auto-detects ramfs vs stream based on /dev/shm space" >&2
+  echo "and disk layout. Must be run as root." >&2
+  echo "" >&2
   echo "Supported formats: .img, .img.xz, .img.gz" >&2
   echo "" >&2
-  echo "Examples (remote):" >&2
-  echo "  flash-live-remote halos.local image.img.xz" >&2
-  echo "  flash-live-remote --config myboat.conf halos.local image.img.xz" >&2
-  echo "  flash-live-remote --stream pi@192.168.1.100 image.img" >&2
+  echo "Examples (local — default):" >&2
+  echo "  sudo flash-live-system image.img.xz" >&2
+  echo "  sudo flash-live-system --config myboat.conf image.img.xz" >&2
+  echo "  sudo flash-live-system --ramfs image.img.xz" >&2
+  echo "  sudo flash-live-system --stream /mnt/usb/image.img.xz" >&2
   echo "" >&2
-  echo "Examples (local):" >&2
-  echo "  sudo flash-live-remote --local image.img.xz                    # auto-detects best mode" >&2
-  echo "  sudo flash-live-remote --local --ramfs image.img.xz            # force ramfs" >&2
-  echo "  sudo flash-live-remote --local --stream /mnt/usb/image.img.xz  # force stream" >&2
-  echo "  sudo flash-live-remote --local --config myboat.conf image.img.xz" >&2
+  echo "Examples (remote):" >&2
+  echo "  flash-live-system --remote halos.local image.img.xz" >&2
+  echo "  flash-live-system --remote pi@192.168.1.100 --config myboat.conf image.img.xz" >&2
+  echo "  flash-live-system --remote halos.local --stream image.img" >&2
   echo "" >&2
   echo "Prerequisites:" >&2
-  echo "  Remote: ssh, scp, xzcat/zcat (for compressed images)" >&2
   echo "  Local:  root access, xzcat/zcat (for compressed images)" >&2
+  echo "  Remote: ssh, scp, xzcat/zcat (for compressed images)" >&2
   echo "  Target: busybox (with fdisk, losetup, mount, umount applets for customization)" >&2
   exit 1
 fi
 
-if [ "$local_mode" = true ]; then
-  host=""
-  image="$1"
-else
-  host="$1"
-  image="$2"
-fi
+image="$1"
 
 # Validate image file exists
 if [ ! -f "$image" ]; then
@@ -145,12 +138,12 @@ case "$image" in
     ;;
 esac
 
-# Fixed /dev/shm filename avoids shell metacharacter issues.
+# Fixed /dev/shm staging filename avoids shell metacharacter issues.
 # The extension is preserved so the helper knows how to decompress.
 case "$image" in
-  *.img.xz) remote_image="/dev/shm/flash-image.img.xz" ;;
-  *.img.gz) remote_image="/dev/shm/flash-image.img.gz" ;;
-  *.img)    remote_image="/dev/shm/flash-image.img" ;;
+  *.img.xz) shm_image="/dev/shm/flash-image.img.xz" ;;
+  *.img.gz) shm_image="/dev/shm/flash-image.img.gz" ;;
+  *.img)    shm_image="/dev/shm/flash-image.img" ;;
 esac
 
 # Get compressed (on-disk) file size
@@ -268,7 +261,7 @@ fi
 if [ ${#ud_lines[@]} -gt 1 ]; then
   custom_user_data=$(printf '%s\n' "${ud_lines[@]}")
   # NoCloud datasource requires meta-data to exist (even if minimal)
-  custom_meta_data="instance-id: flash-live-remote-$(date +%s)"
+  custom_meta_data="instance-id: flash-live-system-$(date +%s)"
 fi
 
 if [ -n "$wifi_ssid" ]; then
@@ -299,9 +292,9 @@ print(psk.hex())
 fi
 
 # Mode-specific prerequisites
-if [ "$local_mode" = true ]; then
+if [ -z "$remote_host" ]; then
   if [ "$(id -u)" -ne 0 ]; then
-    echo "Error: --local mode must be run as root (use sudo)" >&2
+    echo "Error: local mode must be run as root (use sudo)" >&2
     exit 1
   fi
   _require "$decompress_cmd"
@@ -331,27 +324,27 @@ image_on_same_disk() {
 # --- run_on_target: execute a command locally or via SSH ---
 
 run_on_target() {
-  if [ "$local_mode" = true ]; then
+  if [ -z "$remote_host" ]; then
     bash -c "$1"
   else
-    ssh -n "$host" "$1"
+    ssh -n "$remote_host" "$1"
   fi
 }
 
 # Pipe stdin to a command on the target (for payload transfer)
 pipe_to_target() {
-  if [ "$local_mode" = true ]; then
+  if [ -z "$remote_host" ]; then
     bash -c "$1"
   else
-    ssh "$host" "$1"
+    ssh "$remote_host" "$1"
   fi
 }
 
 target_label() {
-  if [ "$local_mode" = true ]; then
+  if [ -z "$remote_host" ]; then
     echo "local device"
   else
-    echo "$host"
+    echo "$remote_host"
   fi
 }
 
@@ -388,7 +381,7 @@ dev_size=$(run_on_target "lsblk -bno SIZE '$root_dev' | head -1")
 dev_size_gb=$((dev_size / 1073741824))
 
 # Auto-detect flash mode for local when not explicitly set
-if [ "$local_mode" = true ] && [ "$mode_explicit" = false ]; then
+if [ -z "$remote_host" ] && [ "$mode_explicit" = false ]; then
   shm_avail=$(run_on_target "df -B1 --output=avail /dev/shm | tail -1 | tr -d ' '")
   required=$((image_size + margin_bytes))
   if [ "$shm_avail" -ge "$required" ]; then
@@ -454,16 +447,16 @@ fi
 # --- Confirmation prompt ---
 
 echo ""
-if [ "$local_mode" = true ]; then
+if [ -z "$remote_host" ]; then
   echo "  Mode: local $mode"
 else
-  echo "  Mode: $mode"
+  echo "  Mode: remote $mode"
 fi
 echo "  Target device: $root_dev (~${dev_size_gb} GB)"
 echo "  Root partition: $root_part"
 echo "  Image file: $image (${image_size_mb} MB ${size_label})"
-if [ "$local_mode" != true ]; then
-  echo "  Target host: $host"
+if [ -n "$remote_host" ]; then
+  echo "  Target host: $remote_host"
 fi
 if [ "$has_customization" = true ]; then
   echo ""
@@ -478,11 +471,11 @@ if [ "$has_customization" = true ]; then
   [ -n "$wifi_ssid" ] && echo "    WiFi: $wifi_ssid (country: $wifi_country)"
 fi
 echo ""
-if [ "$local_mode" = true ]; then
+if [ -z "$remote_host" ]; then
   echo "WARNING: This will ERASE ALL DATA on $root_dev."
   echo "The device will reboot when flashing is done."
 else
-  echo "WARNING: This will ERASE ALL DATA on $root_dev on $host."
+  echo "WARNING: This will ERASE ALL DATA on $root_dev on $remote_host."
   echo "The device will be unreachable during flashing and will reboot when done."
 fi
 echo ""
@@ -637,16 +630,16 @@ flash_ramfs() {
   echo "=== Phase 1: Copying image to target ==="
 
   echo "Copying image to /dev/shm on target..."
-  scp -O "$image" "$host:$remote_image"
+  scp -O "$image" "$remote_host:$shm_image"
 
   # Verify file size matches
-  remote_size=$(ssh -n "$host" "stat -c%s '$remote_image'")
+  remote_size=$(ssh -n "$remote_host" "stat -c%s '$shm_image'")
   if [ "$remote_size" != "$image_size" ]; then
     echo "Error: size mismatch after transfer" >&2
     echo "  Local:  $image_size bytes" >&2
     echo "  Remote: $remote_size bytes" >&2
     echo "Cleaning up remote file..."
-    ssh -n "$host" "rm -f '$remote_image'"
+    ssh -n "$remote_host" "rm -f '$shm_image'"
     exit 1
   fi
   echo "Transfer verified: $remote_size bytes"
@@ -655,18 +648,18 @@ flash_ramfs() {
   echo "=== Phase 2: Flashing image ==="
 
   echo "Stopping services on target..."
-  ssh -n "$host" "sudo systemctl stop 'container-*' 'marine-*' 'halos-*' cockpit docker 2>/dev/null || true; sync"
+  ssh -n "$remote_host" "sudo systemctl stop 'container-*' 'marine-*' 'halos-*' cockpit docker 2>/dev/null || true; sync"
 
   deploy_ramfs_helper
 
   echo "Launching flash helper on target..."
-  ssh -n "$host" "sudo setsid /dev/shm/flash-helper.sh '$remote_image' '$root_dev' '$decompress_cmd' </dev/null >/dev/shm/flash-helper.log 2>&1 &"
+  ssh -n "$remote_host" "sudo setsid /dev/shm/flash-helper.sh '$shm_image' '$root_dev' '$decompress_cmd' </dev/null >/dev/shm/flash-helper.log 2>&1 &"
 
   echo ""
   echo "Image is being flashed on the target device."
   echo "The device will reboot automatically when done."
   echo ""
-  echo "Wait ~60s then try: ssh $host"
+  echo "Wait ~60s then try: ssh $remote_host"
 }
 
 # --- Stream mode ---
@@ -677,7 +670,7 @@ flash_stream() {
 
   # Deploy helper script — reads image data from stdin (piped via SSH),
   # writes to block device, then reboots.
-  ssh "$host" "cat > /dev/shm/flash-helper.sh" <<'HELPER_EOF'
+  ssh "$remote_host" "cat > /dev/shm/flash-helper.sh" <<'HELPER_EOF'
 #!/bin/bash
 
 # Phase 1 — runs under /bin/bash from rootfs (safe: dd hasn't started yet).
@@ -718,10 +711,10 @@ fi
 echo "flash-helper: rebooting..."
 HELPER_EOF
 
-  ssh -n "$host" "chmod +x /dev/shm/flash-helper.sh"
+  ssh -n "$remote_host" "chmod +x /dev/shm/flash-helper.sh"
 
   echo "Stopping services on target..."
-  ssh -n "$host" "sudo systemctl stop 'container-*' 'marine-*' 'halos-*' cockpit docker 2>/dev/null || true; sync"
+  ssh -n "$remote_host" "sudo systemctl stop 'container-*' 'marine-*' 'halos-*' cockpit docker 2>/dev/null || true; sync"
 
   echo ""
   echo "=== Phase 2: Streaming image ==="
@@ -734,7 +727,7 @@ HELPER_EOF
   # failures (real error) from SSH connection drops (expected).
   set +eo pipefail
   # shellcheck disable=SC2029  # $root_dev is intentionally expanded client-side
-  "$decompress_cmd" "$image" | ssh "$host" "sudo /dev/shm/flash-helper.sh '$root_dev'"
+  "$decompress_cmd" "$image" | ssh "$remote_host" "sudo /dev/shm/flash-helper.sh '$root_dev'"
   decompress_exit=${PIPESTATUS[0]}
   set -eo pipefail
 
@@ -752,7 +745,7 @@ HELPER_EOF
   echo "Transfer complete (${elapsed_s}s)."
   echo "The device will reboot automatically."
   echo ""
-  echo "Wait ~60s then try: ssh $host"
+  echo "Wait ~60s then try: ssh $remote_host"
 }
 
 # --- Local ramfs mode ---
@@ -764,17 +757,17 @@ flash_local_ramfs() {
   echo ""
   echo "=== Phase 1: Copying image to /dev/shm ==="
 
-  echo "Copying $image to $remote_image..."
-  cp "$image" "$remote_image"
+  echo "Copying $image to $shm_image..."
+  cp "$image" "$shm_image"
 
   # Verify file size matches
-  local_copy_size=$(stat -c%s "$remote_image")
+  local_copy_size=$(stat -c%s "$shm_image")
   if [ "$local_copy_size" != "$image_size" ]; then
     echo "Error: size mismatch after copy" >&2
     echo "  Original: $image_size bytes" >&2
     echo "  Copy:     $local_copy_size bytes" >&2
     echo "Cleaning up..."
-    rm -f "$remote_image"
+    rm -f "$shm_image"
     exit 1
   fi
   echo "Copy verified: $local_copy_size bytes"
@@ -792,7 +785,7 @@ flash_local_ramfs() {
   echo "Launching flash helper..."
   # Run in foreground — no SSH session to survive, and the user needs to see
   # that flashing is still in progress. The EXIT trap in the helper reboots.
-  exec /dev/shm/flash-helper.sh "$remote_image" "$root_dev" "$decompress_cmd"
+  exec /dev/shm/flash-helper.sh "$shm_image" "$root_dev" "$decompress_cmd"
 }
 
 # --- Local stream mode ---
@@ -867,7 +860,7 @@ LOCAL_STREAM_EOF
 
 # --- Dispatch ---
 
-if [ "$local_mode" = true ]; then
+if [ -z "$remote_host" ]; then
   case "$mode" in
     ramfs)  flash_local_ramfs ;;
     stream) flash_local_stream ;;
