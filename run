@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+#
+# usage: ./run command [argument ...]
+#
+# Commands for flash-live-system development.
+#
+
+set -o nounset
+set -o pipefail
+set -o errexit
+
+# Change the current directory to the project root.
+PROJECT_ROOT=${0%/*}
+if [[ $0 != "$PROJECT_ROOT" && $PROJECT_ROOT != "" ]]; then
+  cd "$PROJECT_ROOT"
+fi
+PROJECT_ROOT=$(pwd)
+readonly PROJECT_ROOT
+
+SOURCE_SCRIPT="$PROJECT_ROOT/flash-live-system"
+DIST_DIR="$PROJECT_ROOT/dist"
+DIST_SCRIPT="$DIST_DIR/flash-live-system"
+
+REQUIRED_APPLETS=(
+  sh dd xzcat zcat cat reboot fdisk losetup mount umount
+  sed awk grep head tr cp mkdir rm df
+)
+
+# Debian base image for extracting busybox-static (arm64)
+DEBIAN_IMAGE="debian:trixie-slim"
+
+function build {
+  #@ Build dist/flash-live-system with embedded static busybox (arm64)
+  #@ Category: Build
+  _bb_tmp=$(mktemp)
+  _bb_b64_file=""
+  trap 'rm -f "$_bb_tmp" "$_bb_b64_file"' EXIT
+
+  echo "=== Extracting busybox-static from Debian arm64 ==="
+  docker run --rm --platform linux/arm64 "$DEBIAN_IMAGE" \
+    sh -c 'apt-get update -qq && apt-get install -y -qq busybox-static >/dev/null 2>&1 && cat /usr/bin/busybox' > "$_bb_tmp"
+
+  local bb_size
+  bb_size=$(stat -f%z "$_bb_tmp" 2>/dev/null || stat -c%s "$_bb_tmp")
+  echo "Binary size: $bb_size bytes ($(( bb_size / 1024 )) KB)"
+
+  # Verify it's a statically-linked aarch64 ELF
+  if ! file "$_bb_tmp" | grep -q "ELF 64-bit.*ARM aarch64.*statically linked"; then
+    echo "Error: extracted binary is not a statically-linked aarch64 ELF" >&2
+    echo "  file says: $(file "$_bb_tmp")" >&2
+    rm -f "$_bb_tmp"
+    exit 1
+  fi
+
+  echo "=== Verifying required applets ==="
+  local applet_list
+  applet_list=$(docker run --rm --platform linux/arm64 \
+    -v "$_bb_tmp:/bb:ro" "$DEBIAN_IMAGE" /bb --list 2>/dev/null || true)
+
+  if [ -z "$applet_list" ]; then
+    echo "Warning: could not verify applets (qemu not available?), proceeding anyway" >&2
+  else
+    local missing=()
+    for applet in "${REQUIRED_APPLETS[@]}"; do
+      if ! echo "$applet_list" | grep -qx "$applet"; then
+        missing+=("$applet")
+      fi
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+      echo "Error: busybox is missing required applets: ${missing[*]}" >&2
+      rm -f "$_bb_tmp"
+      exit 1
+    fi
+    echo "All ${#REQUIRED_APPLETS[@]} required applets present"
+  fi
+
+  echo "=== Base64-encoding ==="
+  _bb_b64_file=$(mktemp)
+  base64 < "$_bb_tmp" > "$_bb_b64_file"
+  local b64_size
+  b64_size=$(stat -f%z "$_bb_b64_file" 2>/dev/null || stat -c%s "$_bb_b64_file")
+  echo "Base64 size: $b64_size bytes ($(( b64_size / 1024 )) KB)"
+
+  echo "=== Splicing into script ==="
+  mkdir -p "$DIST_DIR"
+
+  # Replace everything between BEGIN/END markers with a function that decodes the binary.
+  # The base64 data is too large for an awk variable, so we read it from a file.
+  awk -v b64file="$_bb_b64_file" '
+    /^# --- BEGIN _extract_busybox ---$/ {
+      print "# --- BEGIN _extract_busybox ---"
+      print "_extract_busybox() {"
+      print "  base64 -d <<'\''BUSYBOX_EOF'\'' > \"$1\""
+      while ((getline line < b64file) > 0) print line
+      close(b64file)
+      print "BUSYBOX_EOF"
+      print "}"
+      skip = 1
+      next
+    }
+    /^# --- END _extract_busybox ---$/ {
+      print "# --- END _extract_busybox ---"
+      skip = 0
+      next
+    }
+    !skip { print }
+  ' "$SOURCE_SCRIPT" > "$DIST_SCRIPT"
+
+  chmod +x "$DIST_SCRIPT"
+
+  local dist_size
+  dist_size=$(stat -f%z "$DIST_SCRIPT" 2>/dev/null || stat -c%s "$DIST_SCRIPT")
+  echo ""
+  echo "Build complete: $DIST_SCRIPT"
+  echo "  Source:  $(stat -f%z "$SOURCE_SCRIPT" 2>/dev/null || stat -c%s "$SOURCE_SCRIPT") bytes"
+  echo "  Output:  $dist_size bytes"
+
+  # Verify the binary is embedded
+  if ! grep -q "BUSYBOX_EOF" "$DIST_SCRIPT"; then
+    echo "Error: BUSYBOX_EOF marker not found in output — build failed" >&2
+    rm -f "$_bb_tmp" "$_bb_b64_file"
+    exit 1
+  fi
+
+  rm -f "$_bb_tmp" "$_bb_b64_file"
+}
+
+function clean {
+  #@ Remove dist/ directory
+  #@ Category: Build
+  echo "Removing $DIST_DIR/"
+  rm -rf "$DIST_DIR"
+}
+
+function help {
+  #@ Show this help message
+  #@ Category: Core
+  echo "usage: ./run command [argument ...]"
+  echo ""
+  echo "Commands for flash-live-system development."
+  echo ""
+  awk '/^function / {
+    fname = $2
+    sub(/[({].*/, "", fname)
+    getline
+    if ($0 ~ /#@/) {
+      desc = $0
+      sub(/.*#@ /, "", desc)
+      getline
+      if ($0 ~ /#@ Category:/) {
+        cat = $0
+        sub(/.*Category: /, "", cat)
+        cmds[cat] = cmds[cat] sprintf("  %-20s %s\n", fname, desc)
+        if (!(cat in order)) { order[cat] = ++n }
+      }
+    }
+  } END {
+    for (i = 1; i <= n; i++) {
+      for (cat in order) {
+        if (order[cat] == i) {
+          printf "%s:\n", cat
+          printf "%s", cmds[cat]
+          printf "\n"
+        }
+      }
+    }
+  }' "$0"
+}
+
+# Route to the appropriate command
+case "${1:-help}" in
+  help)
+    help
+    ;;
+  *)
+    if declare -f "$1" > /dev/null; then
+      "$@"
+    else
+      echo "Unknown command: $1"
+      help
+      exit 1
+    fi
+    ;;
+esac

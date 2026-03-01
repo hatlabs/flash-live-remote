@@ -1,0 +1,29 @@
+name: Verify Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify release asset
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check asset exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ASSETS=$(gh release view "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --json assets --jq '.assets[].name')
+
+          if echo "$ASSETS" | grep -q "flash-live-system"; then
+            echo "Release asset found: flash-live-system"
+          else
+            echo "ERROR: flash-live-system asset not found in release"
+            echo "Assets: $ASSETS"
+            exit 1
+          fi

@@ -4,9 +4,11 @@ Flash a Linux SBC — locally on the device itself or over the network. Transfer
 
 ## Prerequisites
 
+The script embeds a statically-linked busybox (arm64), so the target device does not need busybox, dd, xzcat, or zcat installed.
+
 **Local mode (default — on the device itself):**
 - Root access (run with `sudo`)
-- `busybox`, `findmnt`, `lsblk`, `dd`, `xzcat` / `zcat`
+- `findmnt`, `lsblk`, `base64` (coreutils — present by default on Debian/RPi OS)
 - Ramfs mode: enough RAM in `/dev/shm` to hold the compressed image
 - Stream mode: image must be on a different block device than the one being flashed
 
@@ -17,23 +19,31 @@ Flash a Linux SBC — locally on the device itself or over the network. Transfer
 - `python3` (only if using `wifi-ssid` in config)
 
 **Remote mode (target device):**
-- `busybox` (with `fdisk`, `losetup`, `mount`, `umount` applets if using customization)
 - SSH access
-- Linux with `systemd`, `findmnt`, `lsblk`, `dd`
+- Linux with `systemd`, `findmnt`, `lsblk`
 - Ramfs mode: enough RAM in `/dev/shm` to hold the compressed image (~4 GB+ devices)
-- Ramfs mode: `xzcat` / `zcat` (for compressed images — present by default on Raspberry Pi OS)
 
 ## Installation
 
-```bash
-# Clone and symlink
-git clone https://github.com/hatlabs/flash-live-system.git
-ln -s "$PWD/flash-live-system/flash-live-system" /usr/local/bin/
+### From GitHub Releases (recommended)
 
-# Or just download the script
-curl -o /usr/local/bin/flash-live-system \
-  https://raw.githubusercontent.com/hatlabs/flash-live-system/main/flash-live-system
+Download the pre-built script with embedded busybox:
+
+```bash
+curl -Lo /usr/local/bin/flash-live-system \
+  https://github.com/hatlabs/flash-live-system/releases/latest/download/flash-live-system
 chmod +x /usr/local/bin/flash-live-system
+```
+
+### Building from source
+
+Requires Docker (for cross-platform busybox extraction):
+
+```bash
+git clone https://github.com/hatlabs/flash-live-system.git
+cd flash-live-system
+./run build
+# Output: dist/flash-live-system
 ```
 
 ## Usage
@@ -141,14 +151,15 @@ Decompresses and pipes the image directly to `dd`. In remote mode, the stream go
 On the device itself:
 ──────────────────────
 Phase 0: Detect root block device
-         Check /dev/shm capacity, decompression tools
+         Check /dev/shm capacity
          Check customization prerequisites*
          Confirm with user
+         Deploy embedded busybox to /dev/shm
          Write cloud-init payloads to /dev/shm*
 Phase 1: cp image.img.xz → /dev/shm/image.img.xz
          Verify file size matches
 Phase 2: Stop services, sync
-         Deploy helper (copies busybox to tmpfs)
+         Deploy helper
          Helper: xzcat /dev/shm/image | dd
          Helper: apply-customization.sh*
          Helper: reboot -f
@@ -163,11 +174,11 @@ On the device itself:
 Phase 0: Detect root block device
          Check customization prerequisites*
          Confirm with user
+         Deploy embedded busybox to /dev/shm
          Write cloud-init payloads to /dev/shm*
 Phase 1: Safety check (image must be on different block device)
          Stop services, sync
-         Copy binaries (busybox, dd, decompressor) to /dev/shm
-Phase 2: /dev/shm/decompress image | /dev/shm/dd → block device
+Phase 2: busybox decompress image | busybox dd → block device
          apply-customization.sh*
          reboot -f
 ```
@@ -179,14 +190,15 @@ Phase 2: /dev/shm/decompress image | /dev/shm/dd → block device
 Dev machine                               Target (Linux SBC)
 ───────────                               ──────────────────
 Phase 0: SSH ──────────────────────────── Detect root block device
-         SSH ──────────────────────────── Check /dev/shm capacity, xzcat/zcat
+         SSH ──────────────────────────── Check /dev/shm capacity
          SSH ──────────────────────────── Check customization prerequisites*
          Confirm with user
+         scp ──────────────────────────── Deploy embedded busybox
          SSH ──────────────────────────── Transfer cloud-init payloads*
 Phase 1: scp image.img.xz ─────────────── /dev/shm/image.img.xz
          SSH ──────────────────────────── Verify file size matches
 Phase 2: SSH ──────────────────────────── Stop services, sync
-         SSH ──────────────────────────── Deploy helper (copies busybox to tmpfs)
+         SSH ──────────────────────────── Deploy helper
          SSH ──────────────────────────── Launch helper (detached)
                                           Helper: xzcat /dev/shm/image | dd
                                           Helper: loop-mount boot partition*
@@ -203,8 +215,9 @@ Dev machine                               Target (Linux SBC)
 Phase 0: SSH ──────────────────────────── Detect root block device
          SSH ──────────────────────────── Check customization prerequisites*
          Confirm with user
+         scp ──────────────────────────── Deploy embedded busybox
          SSH ──────────────────────────── Transfer cloud-init payloads*
-Phase 1: SSH ──────────────────────────── Deploy helper (copies busybox to tmpfs)
+Phase 1: SSH ──────────────────────────── Deploy helper
          SSH ──────────────────────────── Stop services, sync
 Phase 2: xzcat | ssh "helper" ─────────── dd writes to block device
                                           Helper: loop-mount boot partition*
@@ -218,7 +231,7 @@ Phase 2: xzcat | ssh "helper" ─────────── dd writes to blo
 - **Ramfs mode is default**: scp/cp provides a pre-flash integrity check (file size verification). If the transfer fails, no destructive action has happened — the device is fully recoverable.
 - **Stream mode uses SSH as transport** (remote): The decompressed image is piped directly through SSH (`xzcat | ssh host "dd ..."`). SSH handles flow control, buffering, and connection lifecycle correctly. When xzcat finishes, SSH sends EOF, dd gets EOF and exits. No nc/ncat needed.
 - **No pivot_root or unmount**: `dd` writes to the raw block device, bypassing the mounted filesystem. `reboot -f` skips sync so the old filesystem cache doesn't write back.
-- **Resolved binary paths**: After dd overwrites the disk, PATH lookups against the rootfs may fail (page cache eviction). All helpers resolve binary paths (busybox, dd) before dd starts. Local stream mode additionally copies the decompressor to tmpfs since it runs concurrently with dd in the same pipe.
+- **Embedded static busybox**: The script embeds a statically-linked busybox binary (arm64, Debian). At runtime it's extracted to `/dev/shm` and used for all target-side operations (`dd`, `xzcat`, `reboot`, etc.). This eliminates shared library dependencies and the need for any tools on the target beyond SSH and basic Linux utilities.
 - **EXIT trap (stream mode)**: The helper uses `trap 'busybox reboot -f' EXIT` to ensure reboot happens even if the SSH session drops during or after the write.
 - **Config file over flags**: Passwords stay in a file (not visible in `ps` or shell history), and settings are written once and reused across flashes.
 
@@ -240,7 +253,8 @@ In local mode (default), the script auto-detects the best mode, so you typically
 - **Stream mode (remote)**: If the transfer fails mid-stream, the device has a partial image and may need manual re-flash.
 - **Local stream mode**: The image file must be on a different block device than the one being flashed. Use local ramfs mode if the image is on the same disk.
 - The helper script stops `container-*`, `marine-*`, `halos-*`, `cockpit`, and `docker` services. Adjust if your target runs different services.
-- Only tested with Raspberry Pi (HaLOS) but should work on any Linux SBC with the listed prerequisites.
+- The embedded busybox is arm64 only. x86 targets are not supported.
+- Only tested with Raspberry Pi (HaLOS) but should work on any arm64 Linux SBC with the listed prerequisites.
 
 ## License
 
