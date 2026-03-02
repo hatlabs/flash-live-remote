@@ -2,6 +2,34 @@
 
 Flash a Linux SBC — locally on the device itself or over the network. Transfers a disk image, overwrites the boot device, and reboots into the new image.
 
+## TL;DR
+
+```bash
+# Install flash-live-system
+sudo curl -Lo /usr/local/bin/flash-live-system \
+  https://github.com/hatlabs/flash-live-system/releases/latest/download/flash-live-system
+sudo chmod +x /usr/local/bin/flash-live-system
+
+# Download a Raspberry Pi OS image
+curl -Lo rpi-os.img.xz \
+  https://downloads.raspberrypi.com/raspios_arm64/images/raspios_arm64-2025-12-04/2025-12-04-raspios-trixie-arm64.img.xz
+
+# Create a config file
+cat > mydevice.conf <<'EOF'
+hostname=mydevice
+user=pi
+password=changeme
+wifi-ssid=MyNetwork
+wifi-password=MyWifiPass
+wifi-country=FI
+EOF
+
+# Flash (run on the device itself)
+sudo flash-live-system --config mydevice.conf rpi-os.img.xz
+```
+
+The device reboots into the new image with your hostname, user, and WiFi pre-configured. See below for remote mode, mode selection, and all config options.
+
 ## Prerequisites
 
 The script embeds a statically-linked busybox (arm64), so the target device does not need busybox, dd, xzcat, or zcat installed.
@@ -272,6 +300,17 @@ Phase 2: xzcat | ssh "helper" ─────────── Helper: remount 
 | **Needs root** | Yes | Yes | No (sudo on target) | No (sudo on target) |
 
 In local mode (default), the script auto-detects the best mode, so you typically don't need to specify `--ramfs` or `--stream`. Use `--remote <host>` for devices you can reach over SSH — use `--stream` for remote devices with less than ~4 GB RAM where the compressed image won't fit in `/dev/shm`.
+
+## Expected console messages
+
+During flashing you may see EXT4-fs errors on the console like:
+
+```
+EXT4-fs error (device nvme0n1p2): __ext4_find_entry:1656: inode #76: comm cron: checksumming directory block 0
+EXT4-fs error (device nvme0n1p2): htree_dirblock_to_tree:1083: inode #76: comm cron: Directory block failed checksum
+```
+
+**These are harmless.** The new image is being written directly to the block device while the old filesystem is still mounted read-only. The kernel's ext4 driver sees the underlying data change and reports corruption — but the old filesystem is being intentionally replaced, so these errors are expected. The device reboots into the new image normally.
 
 ## Limitations
 
