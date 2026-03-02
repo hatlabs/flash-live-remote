@@ -23,7 +23,7 @@ DIST_SCRIPT="$DIST_DIR/flash-live-system"
 
 REQUIRED_APPLETS=(
   sh dd xzcat zcat cat reboot fdisk losetup mount umount
-  sed awk grep head tr cp mkdir rm df
+  sed awk grep head tr cp mkdir rm df chmod
 )
 
 # Debian base image for extracting busybox-static (arm64)
@@ -123,6 +123,25 @@ function build {
   fi
 
   rm -f "$_bb_tmp" "$_bb_b64_file"
+}
+
+function bumpversion {
+  #@ Bump version (patch|minor|major)
+  #@ Category: Version
+  local BUMP_TYPE="${1:-}"
+
+  if [[ -z "$BUMP_TYPE" ]] || [[ ! "$BUMP_TYPE" =~ ^(patch|minor|major)$ ]]; then
+    echo "Usage: ./run bumpversion [patch|minor|major]"
+    exit 1
+  fi
+
+  if ! command -v bumpversion &> /dev/null; then
+    echo "Error: bumpversion not installed. Install with: pip install bump2version"
+    exit 1
+  fi
+
+  echo "Bumping $BUMP_TYPE version..."
+  command bumpversion "$BUMP_TYPE"
 }
 
 function clean {
