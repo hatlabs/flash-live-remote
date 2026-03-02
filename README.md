@@ -301,6 +301,17 @@ Phase 2: xzcat | ssh "helper" ─────────── Helper: remount 
 
 In local mode (default), the script auto-detects the best mode, so you typically don't need to specify `--ramfs` or `--stream`. Use `--remote <host>` for devices you can reach over SSH — use `--stream` for remote devices with less than ~4 GB RAM where the compressed image won't fit in `/dev/shm`.
 
+## Expected console messages
+
+During flashing you may see EXT4-fs errors on the console like:
+
+```
+EXT4-fs error (device nvme0n1p2): __ext4_find_entry:1656: inode #76: comm cron: checksumming directory block 0
+EXT4-fs error (device nvme0n1p2): htree_dirblock_to_tree:1083: inode #76: comm cron: Directory block failed checksum
+```
+
+**These are harmless.** The new image is being written directly to the block device while the old filesystem is still mounted read-only. The kernel's ext4 driver sees the underlying data change and reports corruption — but the old filesystem is being intentionally replaced, so these errors are expected. The device reboots into the new image normally.
+
 ## Limitations
 
 - **Stream mode (remote)**: If the transfer fails mid-stream, the device has a partial image and may need manual re-flash.
