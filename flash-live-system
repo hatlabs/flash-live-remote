@@ -263,6 +263,10 @@ if [ "$has_customization" = true ]; then
         echo "Error: SSH key contains reserved delimiter '__FLASH_': $keyfile" >&2
         exit 1
       fi
+      if [[ "$_key_line" == *"'"* ]]; then
+        echo "Error: SSH key contains single quote (would break generated script): $keyfile" >&2
+        exit 1
+      fi
       ssh_key_lines+=("$_key_line")
     done
   fi
@@ -330,7 +334,9 @@ if [ "$has_customization" = true ]; then
     fr_lines+=("    FIRSTUSERHOME='/home/$custom_user'")
     fr_lines+=("  fi")
     if [ -n "$custom_password" ]; then
-      fr_lines+=("  printf '%s:%s\\n' '$custom_user' \"\$_PW\" | chpasswd")
+      fr_lines+=("  if id '$custom_user' >/dev/null 2>&1; then")
+      fr_lines+=("    printf '%s:%s\\n' '$custom_user' \"\$_PW\" | chpasswd")
+      fr_lines+=("  fi")
     fi
     fr_lines+=("fi")
     fr_lines+=("")
@@ -343,7 +349,11 @@ if [ "$has_customization" = true ]; then
       for key in "${ssh_key_lines[@]}"; do
         key_args+=" '$key'"
       done
-      fr_lines+=("  /usr/lib/raspberrypi-sys-mods/imager_custom enable_ssh -k$key_args")
+      if [ -z "$custom_password" ]; then
+        fr_lines+=("  /usr/lib/raspberrypi-sys-mods/imager_custom enable_ssh -k$key_args")
+      else
+        fr_lines+=("  /usr/lib/raspberrypi-sys-mods/imager_custom enable_ssh -p$key_args")
+      fi
       fr_lines+=("else")
       fr_lines+=("  install -o '$custom_user' -g '$custom_user' -m 700 -d \"\$FIRSTUSERHOME/.ssh\"")
       fr_lines+=("  cat > \"\$FIRSTUSERHOME/.ssh/authorized_keys\" <<'__FLASH_SSH_KEYS__'")
@@ -359,7 +369,7 @@ if [ "$has_customization" = true ]; then
       fr_lines+=("  systemctl enable ssh")
       fr_lines+=("fi")
       fr_lines+=("")
-    elif [ -n "$custom_user" ]; then
+    else
       # SSH keys not provided but user is set — still enable SSH
       fr_lines+=("# Enable SSH")
       fr_lines+=("if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then")
